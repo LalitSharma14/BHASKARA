@@ -2,94 +2,117 @@ from ultralytics import YOLOWorld
 
 
 # --------------------------------------------------
-# 1. Load YOLO-World model once
+# 1. Load YOLO-World model
 # --------------------------------------------------
 
 model = YOLOWorld("yolov8s-world.pt")
 
 
 # --------------------------------------------------
-# 2. Define the classes BHASKARA currently cares about
+# 2. Objects users may want to find
 # --------------------------------------------------
 
-SEARCH_CLASSES = [
-    "bed",
-    "laptop",
-    "charger",
-    "wired earphones",
+FINDABLE_OBJECTS = [
     "keys",
-    ""
+    "wallet",
+    "glasses",
+    "wired earphones",
+    "wireless earbuds",
+    "charger",
+    "mobile phone",
+    "remote control",
+    "bottle",
+    "book",
+    "backpack",
+    "watch",
+    "shoes",
+    "medicine box",
+    "USB drive",
+    "ID card",
+    "pen",
+    "scissors",
+    "cup",
+    "mouse",
+    "keyboard",
+    "clothes"
 ]
 
 
-# Tell YOLO-World which classes to search for
+# --------------------------------------------------
+# 3. Objects useful for describing location
+# --------------------------------------------------
+
+LOCATION_OBJECTS = [
+    "bed",
+    "chair",
+    "table",
+    "desk",
+    "room door",
+    "glass window",
+    "shelf",
+    "cabinet",
+    "fan",
+    "sofa",
+    "pillow",
+    "blanket",
+    "television",
+    "laptop"
+]
+
+
+# --------------------------------------------------
+# 4. Complete search vocabulary
+# --------------------------------------------------
+
+SEARCH_CLASSES = (
+    FINDABLE_OBJECTS
+    + LOCATION_OBJECTS
+    + [""]
+)
+
 model.set_classes(SEARCH_CLASSES)
 
 
 # --------------------------------------------------
-# 3. Classes we actually want returned
+# 5. Valid classes
 # --------------------------------------------------
 
-ALLOWED_CLASSES = {
-    "bed",
-    "laptop",
-    "charger",
-    "wired earphones",
-    "keys"
-}
+ALLOWED_CLASSES = set(
+    FINDABLE_OBJECTS
+    + LOCATION_OBJECTS
+)
 
 
 # --------------------------------------------------
-# 4. Reusable detection function
+# 6. Reusable detection function
 # --------------------------------------------------
 
-def detect_objects(image_path):
-    """
-    Detect objects in an image using YOLO-World.
+def detect_objects(image):
 
-    Returns a list of dictionaries.
-    Each dictionary contains:
-    - object name
-    - confidence
-    - bounding box
-    """
-
-    # Run YOLO-World detection
     results = model.predict(
-        image_path,
+        image,
         conf=0.15,
-        imgsz=1280,
-        iou=0.45,
+        imgsz=960,
+        iou=0.35,
         verbose=False
     )
 
-    # We are currently processing one image at a time
     result = results[0]
 
     detections = []
 
 
-    # --------------------------------------------------
-    # Process every prediction
-    # --------------------------------------------------
-
     for box in result.boxes:
 
-        class_id = int(
-            box.cls[0]
-        )
+        class_id = int(box.cls[0])
 
-        object_name = result.names[
-            class_id
-        ]
+        object_name = result.names[class_id]
 
-        confidence = float(
-            box.conf[0]
-        )
+        confidence = float(box.conf[0])
 
 
         # ----------------------------------------------
-        # Filter unwanted classes
+        # Ignore unwanted classes
         # ----------------------------------------------
 
         if object_name not in ALLOWED_CLASSES:
@@ -97,15 +120,22 @@ def detect_objects(image_path):
 
 
         # ----------------------------------------------
-        # Filter weak detections
+        # Different confidence thresholds
         # ----------------------------------------------
 
-        if confidence < 0.20:
+        if object_name in FINDABLE_OBJECTS:
+            min_confidence = 0.25
+
+        else:
+            min_confidence = 0.40
+
+
+        if confidence < min_confidence:
             continue
 
 
         # ----------------------------------------------
-        # Get bounding-box coordinates
+        # Get bounding box
         # ----------------------------------------------
 
         x1, y1, x2, y2 = map(
@@ -113,36 +143,52 @@ def detect_objects(image_path):
             box.xyxy[0]
         )
 
+
         width = x2 - x1
         height = y2 - y1
 
 
-        # ----------------------------------------------
         # Ignore extremely tiny detections
-        # ----------------------------------------------
-
         if width < 15 or height < 15:
             continue
 
 
         # ----------------------------------------------
-        # Store clean detection
+        # Normalize descriptive prompt names
         # ----------------------------------------------
 
-        detection = {
-            "object": object_name,
+        if object_name == "room door":
+            final_name = "door"
+
+        elif object_name == "glass window":
+            final_name = "window"
+
+        else:
+            final_name = object_name
+
+
+        # ----------------------------------------------
+        # Determine object type
+        # ----------------------------------------------
+
+        if object_name in FINDABLE_OBJECTS:
+            object_type = "findable"
+
+        else:
+            object_type = "location"
+
+
+        detections.append({
+            "object": final_name,
             "confidence": confidence,
             "box": (
                 x1,
                 y1,
                 x2,
                 y2
-            )
-        }
-
-        detections.append(
-            detection
-        )
+            ),
+            "type": object_type
+        })
 
 
     return detections
