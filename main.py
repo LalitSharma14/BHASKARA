@@ -1,95 +1,75 @@
-from sahi import AutoDetectionModel
-from sahi.predict import get_sliced_prediction
-import cv2
+# --------------------------------------------------
+# BHASKARA
+# Main Application
+# --------------------------------------------------
+
+# Import our object detection function
+# from detection/detector.py
+from detection.detector import detect_objects
 
 
-# Load Objects365 model
-detection_model = AutoDetectionModel.from_pretrained(
-    model_type="ultralytics",
-    model_path="yolo26s-objv1-150.pt",
-    confidence_threshold=0.40,
-    device="cpu"
+# --------------------------------------------------
+# 1. START BHASKARA
+# --------------------------------------------------
+
+print("\nBHASKARA starting...\n")
+
+
+# --------------------------------------------------
+# 2. IMAGE TO ANALYZE
+# --------------------------------------------------
+
+image_path = "images/room.jpeg"
+
+
+# --------------------------------------------------
+# 3. RUN OBJECT DETECTION
+# --------------------------------------------------
+
+print("Scanning image...\n")
+
+detections = detect_objects(image_path)
+
+
+# --------------------------------------------------
+# 4. PRINT NUMBER OF OBJECTS FOUND
+# --------------------------------------------------
+
+print(
+    "Objects detected:",
+    len(detections)
 )
 
-
-# Run sliced detection
-result = get_sliced_prediction(
-    "images/room.jpeg",
-    detection_model,
-    slice_height=320,
-    slice_width=320,
-    overlap_height_ratio=0.20,
-    overlap_width_ratio=0.20
-)
+print()
 
 
-# Read original image
-image = cv2.imread("images/room.jpeg")
+# --------------------------------------------------
+# 5. DISPLAY DETECTION INFORMATION
+# --------------------------------------------------
 
+for detection in detections:
 
-for prediction in result.object_prediction_list:
+    # Get information from detector.py
+    object_name = detection["object"]
+    confidence = detection["confidence"]
+    box = detection["box"]
 
-    object_name = prediction.category.name
-    confidence = prediction.score.value
+    # Convert confidence from 0-1 to percentage
+    confidence_percentage = confidence * 100
 
-    x1, y1, x2, y2 = map(
-        int,
-        prediction.bbox.to_xyxy()
-    )
-
-    # Draw bounding box
-    cv2.rectangle(
-        image,
-        (x1, y1),
-        (x2, y2),
-        (0, 255, 0),
-        2
-    )
-
-    label = f"{object_name} {confidence * 100:.1f}%"
-
-    # Find size of label text
-    (text_width, text_height), baseline = cv2.getTextSize(
-        label,
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.5,
-        1
-    )
-
-    # Position label
-    label_y = max(y1, text_height + 10)
-
-    # Draw filled background behind label
-    cv2.rectangle(
-        image,
-        (x1, label_y - text_height - 8),
-        (x1 + text_width + 8, label_y),
-        (0, 255, 0),
-        -1
-    )
-
-    # Draw label text
-    cv2.putText(
-        image,
-        label,
-        (x1 + 4, label_y - 4),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.5,
-        (0, 0, 0),
-        1
-    )
-
+    # Print object information
     print(
         object_name,
-        round(confidence * 100, 2),
-        "%"
+        "-",
+        round(confidence_percentage, 2),
+        "%",
+        "| Box:",
+        box
     )
 
 
-cv2.imshow(
-    "BHASKARA - Clean Sliced Detection",
-    image
-)
+# --------------------------------------------------
+# 6. FINISHED
+# --------------------------------------------------
 
-cv2.waitKey(0)
-cv2.destroyAllWindows()
+print("\nBHASKARA scan complete.")
