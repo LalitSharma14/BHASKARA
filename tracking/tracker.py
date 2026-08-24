@@ -1,18 +1,39 @@
 # --------------------------------------------------
 # BHASKARA
-# Object Tracking Module
+# Tracking Module
+#
+# Pipeline:
+# final_detector.py
+#      ↓
+# Grounding DINO + SigLIP
+#      ↓
+# clean detections
+#      ↓
+# ByteTrack
+#      ↓
+# persistent track IDs
 # --------------------------------------------------
 
-from detection.detector import (
-    model,
-    FINDABLE_OBJECTS,
-    LOCATION_OBJECTS,
-    ALLOWED_CLASSES
+import numpy as np
+import supervision as sv
+
+from detection.final_detector import detect_final_objects
+
+
+# --------------------------------------------------
+# 1. Create ByteTrack tracker
+# --------------------------------------------------
+
+tracker = sv.ByteTrack(
+    track_activation_threshold=0.25,
+    lost_track_buffer=30,
+    minimum_matching_threshold=0.80,
+    frame_rate=30
 )
 
 
 # --------------------------------------------------
-# 1. Track objects in a video frame
+# 2. Track one video frame
 # --------------------------------------------------
 
 def track_objects(frame):
@@ -20,180 +41,197 @@ def track_objects(frame):
     Detect and track objects in a video frame.
 
     Returns:
-        A list of dictionaries containing:
 
-        object      -> object name
-        confidence  -> detection confidence
-        box         -> bounding box
-        type        -> findable / location
-        track_id    -> unique tracking ID
+    [
+        {
+            "object": "glasses",
+            "confidence": 0.79,
+            "box": (x1, y1, x2, y2),
+            "type": "findable",
+            "track_id": 3
+        }
+    ]
     """
 
 
     # --------------------------------------------------
-    # 2. Run YOLO-World + ByteTrack
+    # 3. Run BHASKARA final detector
     # --------------------------------------------------
 
-    results = model.track(
-        frame,
-
-        # Keep tracking information between frames
-        persist=True,
-
-        # Use ByteTrack
-        tracker="bytetrack.yaml",
-
-        # Detection settings
-        conf=0.15,
-        imgsz=960,
-        iou=0.35,
-
-        verbose=False
+    detections = detect_final_objects(
+        frame
     )
 
 
-    result = results[0]
+    # No detections
+    if len(detections) == 0:
+
+        return []
+
+
+    # --------------------------------------------------
+    # 4. Convert BHASKARA detections
+    #    into arrays ByteTrack understands
+    # --------------------------------------------------
+
+    boxes = []
+
+    confidences = []
+
+    class_ids = []
+
+
+    # We need our own mapping:
+    #
+    # object name -> integer ID
+    # --------------------------------------------------
+
+    object_names = []
+
+    name_to_id = {}
+
+
+    for detection in detections:
+
+        object_name = detection[
+            "object"
+        ]
+
+
+        # Create numeric class ID
+        if object_name not in name_to_id:
+
+            name_to_id[
+                object_name
+            ] = len(name_to_id)
+
+
+        class_id = name_to_id[
+            object_name
+        ]
+
+
+        boxes.append(
+            detection["box"]
+        )
+
+        confidences.append(
+            detection["confidence"]
+        )
+
+        class_ids.append(
+            class_id
+        )
+
+        object_names.append(
+            object_name
+        )
+
+
+    # --------------------------------------------------
+    # 5. Create Supervision Detections object
+    # --------------------------------------------------
+
+    sv_detections = sv.Detections(
+
+        xyxy=np.array(
+            boxes,
+            dtype=np.float32
+        ),
+
+        confidence=np.array(
+            confidences,
+            dtype=np.float32
+        ),
+
+        class_id=np.array(
+            class_ids,
+            dtype=np.int32
+        )
+    )
+
+
+    # --------------------------------------------------
+    # 6. Run ByteTrack
+    # --------------------------------------------------
+
+    tracked = tracker.update_with_detections(
+        sv_detections
+    )
+
+
+    # --------------------------------------------------
+    # 7. Build final tracked-object list
+    # --------------------------------------------------
 
     tracked_objects = []
 
 
-    # --------------------------------------------------
-    # 3. Process every detected/tracked object
-    # --------------------------------------------------
-
-    for box in result.boxes:
-
-        class_id = int(
-            box.cls[0]
-        )
-
-        object_name = result.names[
-            class_id
-        ]
-
-        confidence = float(
-            box.conf[0]
-        )
-
-
-        # --------------------------------------------------
-        # Ignore classes BHASKARA doesn't care about
-        # --------------------------------------------------
-
-        if object_name not in ALLOWED_CLASSES:
-            continue
-
-
-        # --------------------------------------------------
-        # Different confidence requirements
-        # --------------------------------------------------
-
-        
-        # --------------------------------------------------
-        # Different confidence requirements
-        # --------------------------------------------------
-
-        if object_name in FINDABLE_OBJECTS:
-
-            # Small/findable objects are often harder to detect,
-            # so we allow a lower confidence threshold.
-            min_confidence = 0.25
-
-
-        elif object_name in [
-            "room door",
-            "glass window",
-            "cabinet",
-            "shelf"
-        ]:
-
-            # Structural objects such as doors, windows,
-            # cabinets and shelves are visually similar.
-            # Require stronger confidence before accepting them.
-            min_confidence = 0.55
-
-
-        else:
-
-            # Other large location objects
-            min_confidence = 0.40
-
-
-        # Ignore detection if confidence is too low
-        if confidence < min_confidence:
-            continue
-
-        
-
-        # --------------------------------------------------
-        # Bounding box
-        # --------------------------------------------------
+    for i in range(
+        len(tracked)
+    ):
 
         x1, y1, x2, y2 = map(
             int,
-            box.xyxy[0]
+            tracked.xyxy[i]
         )
 
 
-        width = x2 - x1
-        height = y2 - y1
+        confidence = float(
+            tracked.confidence[i]
+        )
 
 
-        if width < 15 or height < 15:
-            continue
+        class_id = int(
+            tracked.class_id[i]
+        )
 
 
-        # --------------------------------------------------
-        # 4. Get tracking ID
-        # --------------------------------------------------
-
-        # ByteTrack attaches an ID to tracked objects.
-        # On some first-frame detections ID can be None.
-        if box.id is not None:
-
-            track_id = int(
-                box.id[0]
-            )
-
-        else:
-
-            track_id = -1
+        track_id = int(
+            tracked.tracker_id[i]
+        )
 
 
         # --------------------------------------------------
-        # Normalize descriptive YOLO-World names
+        # Recover object name
         # --------------------------------------------------
 
-        if object_name == "room door":
-            final_name = "door"
-
-        elif object_name == "glass window":
-            final_name = "window"
-
-        else:
-            final_name = object_name
+        object_name = None
 
 
-        # --------------------------------------------------
-        # Find object type
-        # --------------------------------------------------
+        for name, numeric_id in name_to_id.items():
 
-        if object_name in FINDABLE_OBJECTS:
+            if numeric_id == class_id:
 
-            object_type = "findable"
-
-        else:
-
-            object_type = "location"
+                object_name = name
+                break
 
 
         # --------------------------------------------------
-        # 5. Save tracked object
+        # Find original object type
+        # --------------------------------------------------
+
+        object_type = "location"
+
+
+        for detection in detections:
+
+            if detection["object"] == object_name:
+
+                object_type = detection[
+                    "type"
+                ]
+
+                break
+
+
+        # --------------------------------------------------
+        # Save tracked object
         # --------------------------------------------------
 
         tracked_objects.append({
 
-            "object": final_name,
+            "object": object_name,
 
             "confidence": confidence,
 

@@ -1,6 +1,18 @@
-import cv2
+# --------------------------------------------------
+# BHASKARA
+# Asynchronous Video Detection
+#
+# Main thread:
+#   reads and displays video smoothly
+#
+# Background thread:
+#   runs Grounding DINO periodically
+# --------------------------------------------------
 
-from tracking.tracker import track_objects
+import cv2
+import threading
+
+from detection.grounding_detector import detect_objects
 
 
 # --------------------------------------------------
@@ -22,20 +34,104 @@ if not video.isOpened():
 
 
 # --------------------------------------------------
-# 3. Frame skipping
+# 3. Get original video FPS
+# --------------------------------------------------
+
+fps = video.get(
+    cv2.CAP_PROP_FPS
+)
+
+# Fallback in case FPS cannot be read
+if fps <= 0:
+    fps = 30
+
+
+# Calculate how long each frame should stay visible
+delay = int(
+    1000 / fps
+)
+
+print(
+    "Video FPS:",
+    round(fps, 2)
+)
+
+
+# --------------------------------------------------
+# 4. Processing settings
 # --------------------------------------------------
 
 frame_number = 0
 
-# Process every second frame for speed
-PROCESS_EVERY = 2
-
-# Store latest tracking results
-last_tracked_objects = []
+# Run Grounding DINO every few frames
+PROCESS_EVERY = 5
 
 
 # --------------------------------------------------
-# 4. Process video frame by frame
+# 5. Shared detection state
+# --------------------------------------------------
+
+# Most recent detections produced
+# by the background detector
+last_detections = []
+
+# True when the detector is currently working
+detection_running = False
+
+# Prevent two threads from changing shared
+# detection data at the same time
+lock = threading.Lock()
+
+
+# --------------------------------------------------
+# 6. Background detection function
+# --------------------------------------------------
+
+def run_detection(frame_copy):
+
+    global last_detections
+    global detection_running
+
+
+    try:
+
+        # ----------------------------------------------
+        # Run Grounding DINO
+        # ----------------------------------------------
+
+        detections = detect_objects(
+            frame_copy,
+            box_threshold=0.25,
+            text_threshold=0.25,
+            nms_threshold=0.35
+        )
+
+
+        # ----------------------------------------------
+        # Safely update latest detections
+        # ----------------------------------------------
+
+        with lock:
+
+            last_detections = detections
+
+
+    except Exception as error:
+
+        print(
+            "Detection error:",
+            error
+        )
+
+
+    finally:
+
+        # Detection finished
+        detection_running = False
+
+
+# --------------------------------------------------
+# 7. Main video loop
 # --------------------------------------------------
 
 while True:
@@ -45,38 +141,77 @@ while True:
     if not success:
         break
 
+
     frame_number += 1
 
 
     # --------------------------------------------------
-    # Run tracking only on selected frames
+    # 8. Start detection periodically
     # --------------------------------------------------
 
-    if frame_number % PROCESS_EVERY == 0:
+    if (
+        frame_number % PROCESS_EVERY == 0
+        and not detection_running
+    ):
 
-        last_tracked_objects = track_objects(
-            frame
+        detection_running = True
+
+
+        # Give background detector its own frame copy
+        frame_copy = frame.copy()
+
+
+        detection_thread = threading.Thread(
+            target=run_detection,
+            args=(frame_copy,),
+            daemon=True
+        )
+
+
+        detection_thread.start()
+
+
+    # --------------------------------------------------
+    # 9. Copy latest detections safely
+    # --------------------------------------------------
+
+    with lock:
+
+        detections_to_draw = list(
+            last_detections
         )
 
 
     # --------------------------------------------------
-    # Draw tracked objects
+    # 10. Draw latest detections
     # --------------------------------------------------
 
-    for tracked_object in last_tracked_objects:
+    for detection in detections_to_draw:
 
-        object_name = tracked_object["object"]
+        object_name = detection[
+            "object"
+        ]
 
-        confidence = tracked_object["confidence"]
+        confidence = detection[
+            "confidence"
+        ]
 
-        track_id = tracked_object["track_id"]
+        x1, y1, x2, y2 = detection[
+            "box"
+        ]
 
-        x1, y1, x2, y2 = tracked_object["box"]
+
+        # ----------------------------------------------
+        # Ignore weak detections
+        # ----------------------------------------------
+
+        if confidence < 0.30:
+            continue
 
 
-        # --------------------------------------------------
+        # ----------------------------------------------
         # Draw bounding box
-        # --------------------------------------------------
+        # ----------------------------------------------
 
         cv2.rectangle(
             frame,
@@ -87,32 +222,40 @@ while True:
         )
 
 
-        # --------------------------------------------------
+        # ----------------------------------------------
         # Create label
-        # --------------------------------------------------
+        # ----------------------------------------------
 
         label = (
             f"{object_name} "
-            f"| ID:{track_id} "
-            f"| {confidence * 100:.0f}%"
+            f"{confidence * 100:.0f}%"
         )
 
 
-        # --------------------------------------------------
-        # Draw label background
-        # --------------------------------------------------
+        # ----------------------------------------------
+        # Calculate text size
+        # ----------------------------------------------
 
-        (text_width, text_height), baseline = cv2.getTextSize(
+        (
+            text_width,
+            text_height
+        ), baseline = cv2.getTextSize(
             label,
             cv2.FONT_HERSHEY_SIMPLEX,
             0.5,
             1
         )
 
+
         label_y = max(
             y1,
             text_height + 10
         )
+
+
+        # ----------------------------------------------
+        # Draw filled label background
+        # ----------------------------------------------
 
         cv2.rectangle(
             frame,
@@ -129,9 +272,9 @@ while True:
         )
 
 
-        # --------------------------------------------------
+        # ----------------------------------------------
         # Draw label text
-        # --------------------------------------------------
+        # ----------------------------------------------
 
         cv2.putText(
             frame,
@@ -148,26 +291,54 @@ while True:
 
 
     # --------------------------------------------------
-    # Display result
+    # 11. Show scanning status
+    # --------------------------------------------------
+
+    if detection_running:
+
+        cv2.putText(
+            frame,
+            "Scanning...",
+            (20, 35),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (0, 255, 255),
+            2
+        )
+
+
+    # --------------------------------------------------
+    # 12. Display frame
     # --------------------------------------------------
 
     cv2.imshow(
-        "BHASKARA - Tracking",
+        "BHASKARA - Async Grounding DINO",
         frame
     )
 
 
+    # --------------------------------------------------
+    # 13. Maintain original video speed
+    # --------------------------------------------------
+
+    key = cv2.waitKey(
+        delay
+    ) & 0xFF
+
+
     # Press Q to stop
-    if cv2.waitKey(1) & 0xFF == ord("q"):
+    if key == ord("q"):
         break
 
 
 # --------------------------------------------------
-# 5. Cleanup
+# 14. Cleanup
 # --------------------------------------------------
 
 video.release()
 
 cv2.destroyAllWindows()
 
-print("Tracking finished.")
+print(
+    "Video detection finished."
+)

@@ -62,7 +62,7 @@ KNOWN_LABELS = [
 
 
 # --------------------------------------------------
-# 2. Objects that users may want to find
+# 2. Objects users may want to find
 # --------------------------------------------------
 
 FINDABLE_OBJECTS = {
@@ -87,8 +87,8 @@ FINDABLE_OBJECTS = {
 
 
 # --------------------------------------------------
-# 3. Extract possible labels from
-#    Grounding DINO compound text
+# 3. Extract possible meanings from
+#    Grounding DINO compound labels
 # --------------------------------------------------
 
 def extract_candidate_labels(compound_label):
@@ -98,25 +98,23 @@ def extract_candidate_labels(compound_label):
     candidates = []
 
 
-    # Search known labels inside Grounding DINO text
+    # Match known labels inside the Grounding DINO text
     for known_label in KNOWN_LABELS:
 
         if known_label in text:
-
             candidates.append(
                 known_label
             )
 
 
     # --------------------------------------------------
-    # Handle vague phrases
+    # Handle vague / partial words
     # --------------------------------------------------
 
     if (
         "earphones" in text
         and "wired earphones" not in candidates
     ):
-
         candidates.append(
             "wired earphones"
         )
@@ -126,7 +124,6 @@ def extract_candidate_labels(compound_label):
         "cable" in text
         and "usb cable" not in candidates
     ):
-
         candidates.append(
             "usb cable"
         )
@@ -136,7 +133,6 @@ def extract_candidate_labels(compound_label):
         "control" in text
         and "remote control" not in candidates
     ):
-
         candidates.append(
             "remote control"
         )
@@ -153,14 +149,14 @@ def extract_candidate_labels(compound_label):
         )
 
 
-    # Remove duplicates while preserving order
+    # Remove duplicate labels while preserving order
     return list(
         dict.fromkeys(candidates)
     )
 
 
 # --------------------------------------------------
-# 4. Main BHASKARA detector
+# 4. Main detector
 # --------------------------------------------------
 
 def detect_final_objects(
@@ -170,34 +166,34 @@ def detect_final_objects(
     nms_threshold=0.40
 ):
     """
-    Run the final BHASKARA vision pipeline.
+    Run BHASKARA's final vision pipeline.
 
     image_input can be:
 
-        1. Image path:
-           "images/room.jpeg"
+    1. Image path:
+       "images/room.jpeg"
 
-        2. OpenCV frame:
-           NumPy array returned by video.read()
+    2. OpenCV video frame:
+       NumPy array returned by video.read()
 
     Returns:
 
-        [
-            {
-                "object": "glasses",
-                "confidence": 0.79,
-                "box": (x1, y1, x2, y2),
-                "type": "findable"
-            }
-        ]
+    [
+        {
+            "object": "glasses",
+            "confidence": 0.79,
+            "box": (x1, y1, x2, y2),
+            "type": "findable"
+        }
+    ]
     """
 
 
     # --------------------------------------------------
-    # 5. Load / prepare image
+    # 5. Prepare OpenCV image
+    #    We need this for cropping and SigLIP
     # --------------------------------------------------
 
-    # If image_input is a path
     if isinstance(image_input, str):
 
         image = cv2.imread(
@@ -214,42 +210,30 @@ def detect_final_objects(
             return []
 
 
-        # Grounding DINO can use the path directly
-        grounding_input = image_input
-
-
-    # If image_input is already a video/OpenCV frame
     else:
 
+        # image_input is assumed to be an OpenCV frame
         image = image_input.copy()
-
-
-        # OpenCV uses BGR
-        # PIL / Grounding DINO expects RGB
-        image_rgb = cv2.cvtColor(
-            image,
-            cv2.COLOR_BGR2RGB
-        )
-
-
-        grounding_input = Image.fromarray(
-            image_rgb
-        )
 
 
     # --------------------------------------------------
     # 6. Run Grounding DINO
+    #
+    # grounding_detector.py already supports:
+    # - image paths
+    # - PIL images
+    # - OpenCV / NumPy frames
     # --------------------------------------------------
 
     detections = detect_objects(
-        grounding_input,
+        image_input,
         box_threshold=box_threshold,
         text_threshold=text_threshold,
         nms_threshold=nms_threshold
     )
 
 
-    # Get full image dimensions
+    # Get image dimensions
     image_height, image_width = image.shape[:2]
 
 
@@ -257,7 +241,7 @@ def detect_final_objects(
 
 
     # --------------------------------------------------
-    # 7. Process every Grounding DINO detection
+    # 7. Process each Grounding DINO detection
     # --------------------------------------------------
 
     for detection in detections:
@@ -276,7 +260,7 @@ def detect_final_objects(
 
 
         # --------------------------------------------------
-        # 8. Extract candidate meanings
+        # 8. Extract candidate object names
         # --------------------------------------------------
 
         candidates = extract_candidate_labels(
@@ -291,15 +275,14 @@ def detect_final_objects(
 
 
         # --------------------------------------------------
-        # 9. Prepare object crop
+        # 9. Prepare crop for SigLIP
         # --------------------------------------------------
 
         box_width = x2 - x1
         box_height = y2 - y1
 
 
-        # Slight padding helps if Grounding DINO
-        # cuts off part of the object
+        # Slight padding around the detected box
         pad_x = int(
             box_width * 0.05
         )
@@ -337,10 +320,10 @@ def detect_final_objects(
 
 
         # --------------------------------------------------
-        # 10. SigLIP verification
-        # --------------------------------------------------
-        # Only run SigLIP when Grounding DINO gives
-        # more than one possible meaning.
+        # 10. Run SigLIP verification
+        #
+        # Only needed when Grounding DINO returns
+        # multiple possible meanings.
         # --------------------------------------------------
 
         if (
@@ -348,14 +331,14 @@ def detect_final_objects(
             and len(candidates) > 1
         ):
 
-            # Convert BGR -> RGB
+            # OpenCV uses BGR
+            # SigLIP/PIL expects RGB
             crop_rgb = cv2.cvtColor(
                 crop,
                 cv2.COLOR_BGR2RGB
             )
 
 
-            # Convert OpenCV image -> PIL
             crop_pil = Image.fromarray(
                 crop_rgb
             )
@@ -375,7 +358,7 @@ def detect_final_objects(
 
 
         # --------------------------------------------------
-        # 11. Normalize final object name
+        # 11. Normalize final label
         # --------------------------------------------------
 
         final_name = normalize_label(
@@ -384,7 +367,7 @@ def detect_final_objects(
 
 
         # --------------------------------------------------
-        # 12. Determine object type
+        # 12. Decide object type
         # --------------------------------------------------
 
         if final_name in FINDABLE_OBJECTS:
@@ -418,7 +401,7 @@ def detect_final_objects(
 
 
     # --------------------------------------------------
-    # 14. Remove repeated detections
+    # 14. Remove duplicate final detections
     # --------------------------------------------------
 
     final_detections = remove_duplicates(
@@ -429,7 +412,7 @@ def detect_final_objects(
 
 
     # --------------------------------------------------
-    # 15. Return final result
+    # 15. Return final results
     # --------------------------------------------------
 
     return final_detections
