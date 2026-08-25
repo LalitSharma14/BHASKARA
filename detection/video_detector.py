@@ -17,12 +17,32 @@ import numpy as np
 from PIL import Image
 
 from detection.grounding_detector import detect_objects
-from verification.verifier import verify_candidates
+from verification.verifier import (
+    get_image_embeddings,
+    verify_candidates
+)
 
 from memory.object_memory import (
     update_memory,
-    get_memory
+    get_memory,
+    get_memory_stats,
+    get_audit_run_directory,
+    write_audit_summary
 )
+
+from tracking.reconciliation import (
+    find_global_assignments,
+    find_lost_track_assignments,
+    select_consensus_label,
+    update_appearance_gallery,
+    update_appearance_prototype
+)
+from tracking.detection_timing import (
+    calculate_result_age,
+    select_reconciled_box,
+    should_accept_result
+)
+from tracking.motion_compensation import transport_detections
 
 
 # ==================================================
@@ -41,8 +61,34 @@ PROCESS_EVERY = 5
 MIN_CONFIRMATIONS = 3
 
 
+MEMORY_CONFIRMATION_REQUIREMENTS = {
+    "id card": 7,
+    "usb cable": 6,
+    "wireless earbuds": 6,
+    "wired earphones": 5,
+    "charger": 5,
+    "clothes": 5,
+    "metal ruler": 5,
+    "keys": 5
+}
+
+
+MIN_MEMORY_HIT_RATIO = 0.55
+MIN_MEMORY_LABEL_STABILITY = 0.70
+
+
 # Keep missed tracks alive briefly
-MAX_MISSED_SCANS = 2
+MAX_MISSED_SCANS = 5
+
+
+# Recently expired tracks remain eligible for
+# conservative exact-label recovery.
+MAX_LOST_TRACK_AGE_FRAMES = 180
+
+
+# Ignore detector results that describe a frame
+# too far behind the current video position.
+MAX_DETECTION_RESULT_AGE = 45
 
 
 # Reject collapsed boxes
@@ -298,13 +344,39 @@ detection_running = False
 
 pending_detections = None
 
+last_detection_age = None
+
+last_motion_compensation = None
+
 
 lock = threading.Lock()
 
 
 tracks = []
 
+lost_tracks = []
+
 next_track_id = 1
+
+
+runtime_stats = {
+    "detector_jobs_started": 0,
+    "detector_results_accepted": 0,
+    "detector_results_stale": 0,
+    "detections_received": 0,
+    "motion_aligned": 0,
+    "appearance_embeddings_received": 0,
+    "active_matches": 0,
+    "lost_tracks_recovered": 0,
+    "reid_same_label_comparisons": 0,
+    "reid_above_threshold": 0,
+    "reid_ambiguous": 0,
+    "reid_similarity_sum": 0.0,
+    "reid_similarity_count": 0,
+    "reid_similarity_max": 0.0,
+    "new_tracks_created": 0,
+    "tracks_expired": 0
+}
 
 
 previous_gray = None
@@ -866,11 +938,63 @@ def verify_if_needed(
 
 
 # ==================================================
+# BATCHED APPEARANCE IDENTITY
+# ==================================================
+
+def attach_appearance_embeddings(frame, detections, source_frame_number):
+    """Attach one normalized SigLIP embedding to each valid detection crop."""
+
+    frame_height, frame_width = frame.shape[:2]
+    crops = []
+    detection_indexes = []
+
+    for index, detection in enumerate(detections):
+        x1, y1, x2, y2 = detection["box"]
+        x1 = max(0, min(int(x1), frame_width - 1))
+        y1 = max(0, min(int(y1), frame_height - 1))
+        x2 = max(0, min(int(x2), frame_width))
+        y2 = max(0, min(int(y2), frame_height))
+
+        crop = frame[y1:y2, x1:x2]
+        if crop.size == 0:
+            detection["appearance_embedding"] = None
+            continue
+
+        crop_rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+        crops.append(Image.fromarray(crop_rgb))
+        detection_indexes.append(index)
+        detection["evidence_crop"] = crop.copy()
+        detection["evidence_frame"] = source_frame_number
+        detection["evidence_confidence"] = detection["confidence"]
+
+    if not crops:
+        return detections
+
+    try:
+        embeddings = get_image_embeddings(crops)
+
+        for detection_index, embedding in zip(
+            detection_indexes,
+            embeddings
+        ):
+            detections[detection_index]["appearance_embedding"] = embedding
+
+    except Exception as error:
+        print("Appearance embedding error:", error)
+
+        for detection_index in detection_indexes:
+            detections[detection_index]["appearance_embedding"] = None
+
+    return detections
+
+
+# ==================================================
 # BACKGROUND GROUNDING DINO
 # ==================================================
 
 def run_detection(
-    frame_copy
+    frame_copy,
+    source_frame_number
 ):
 
     global detection_running
@@ -986,11 +1110,23 @@ def run_detection(
             })
 
 
+        clean_detections = attach_appearance_embeddings(
+            frame_copy,
+            clean_detections,
+            source_frame_number
+        )
+
+
         with lock:
 
-            pending_detections = (
-                clean_detections
-            )
+            pending_detections = {
+                "detections": clean_detections,
+                "source_frame_number": source_frame_number,
+                "source_gray": cv2.cvtColor(
+                    frame_copy,
+                    cv2.COLOR_BGR2GRAY
+                )
+            }
 
 
     except Exception as error:
@@ -1012,10 +1148,13 @@ def run_detection(
 
 def update_tracks_with_detections(
     detections,
-    gray_image
+    gray_image,
+    detection_age_frames=0,
+    current_frame_number=0
 ):
 
     global tracks
+    global lost_tracks
     global next_track_id
 
 
@@ -1035,11 +1174,99 @@ def update_tracks_with_detections(
     updated_tracks = []
 
 
+    lost_tracks = [
+        track
+        for track in lost_tracks
+        if (
+            current_frame_number
+            - track.get("lost_at_frame", current_frame_number)
+            <= MAX_LOST_TRACK_AGE_FRAMES
+        )
+    ]
+
+
+    assignments = find_global_assignments(
+
+        detections,
+
+        tracks,
+
+        frame_diagonal,
+
+        lambda box: is_valid_box(
+            box,
+            frame_width,
+            frame_height
+        )
+    )
+
+
+    unmatched_indexes = [
+        index
+        for index in range(len(detections))
+        if index not in assignments
+    ]
+
+
+    unmatched_detections = [
+        detections[index]
+        for index in unmatched_indexes
+    ]
+
+
+    (
+        local_lost_assignments,
+        reid_diagnostics
+    ) = find_lost_track_assignments(
+
+        unmatched_detections,
+
+        lost_tracks,
+
+        frame_diagonal,
+
+        lambda box: is_valid_box(
+            box,
+            frame_width,
+            frame_height
+        ),
+
+        return_diagnostics=True
+    )
+
+
+    runtime_stats["reid_same_label_comparisons"] += (
+        reid_diagnostics["same_label_comparisons"]
+    )
+    runtime_stats["reid_above_threshold"] += (
+        reid_diagnostics["above_threshold"]
+    )
+    runtime_stats["reid_ambiguous"] += reid_diagnostics["ambiguous"]
+
+
+    for similarity in reid_diagnostics["best_similarities"]:
+        runtime_stats["reid_similarity_sum"] += similarity
+        runtime_stats["reid_similarity_count"] += 1
+        runtime_stats["reid_similarity_max"] = max(
+            runtime_stats["reid_similarity_max"],
+            similarity
+        )
+
+
+    lost_assignments = {
+        unmatched_indexes[local_index]: assignment
+        for local_index, assignment in local_lost_assignments.items()
+    }
+
+
+    recovered_track_ids = set()
+
+
     # ==================================================
     # PROCESS FRESH DETECTIONS
     # ==================================================
 
-    for detection in detections:
+    for detection_index, detection in enumerate(detections):
 
         new_box = detection[
             "box"
@@ -1056,6 +1283,11 @@ def update_tracks_with_detections(
         ]
 
 
+        appearance_observation = detection.get(
+            "appearance_embedding"
+        )
+
+
         if not is_valid_box(
             new_box,
             frame_width,
@@ -1065,123 +1297,19 @@ def update_tracks_with_detections(
             continue
 
 
-        new_center = get_box_center(
-            new_box
+        best_track, best_score = assignments.get(
+            detection_index,
+            lost_assignments.get(
+                detection_index,
+                (None, 0.0)
+            )
         )
 
 
-        best_track = None
-
-        best_score = 0.0
-
-
-        # --------------------------------------------------
-        # Try to find the same physical object
-        # --------------------------------------------------
-
-        for track in tracks:
-
-            if track["id"] in used_track_ids:
-                continue
-
-
-            old_box = track[
-                "box"
-            ]
-
-
-            if not is_valid_box(
-                old_box,
-                frame_width,
-                frame_height
-            ):
-
-                continue
-
-
-            iou = calculate_iou(
-                new_box,
-                old_box
-            )
-
-
-            containment = calculate_containment(
-                new_box,
-                old_box
-            )
-
-
-            old_center = get_box_center(
-                old_box
-            )
-
-
-            dx = (
-                new_center[0]
-                - old_center[0]
-            )
-
-
-            dy = (
-                new_center[1]
-                - old_center[1]
-            )
-
-
-            center_distance = (
-                dx * dx
-                + dy * dy
-            ) ** 0.5
-
-
-            normalized_distance = (
-                center_distance
-                / frame_diagonal
-            )
-
-
-            # --------------------------------------------------
-            # Spatial matching matters more than class name.
-            #
-            # This allows:
-            #
-            # desk → bed
-            #
-            # while keeping the same physical track.
-            # --------------------------------------------------
-
-            score = 0.0
-
-
-            score += (
-                iou * 0.60
-            )
-
-
-            score += (
-                containment * 0.30
-            )
-
-
-            if normalized_distance < 0.08:
-
-                score += 0.15
-
-
-            # Label match helps but is NOT required
-            if (
-                track["object"]
-                == new_label
-            ):
-
-                score += 0.15
-
-
-            if score > best_score:
-
-                best_score = score
-
-                best_track = track
+        recovered_from_lost = (
+            detection_index in lost_assignments
+            and detection_index not in assignments
+        )
 
 
         # ==================================================
@@ -1203,12 +1331,41 @@ def update_tracks_with_detections(
             )
 
 
+            if recovered_from_lost:
+
+                recovered_track_ids.add(track_id)
+                runtime_stats["lost_tracks_recovered"] += 1
+
+
+            else:
+
+                runtime_stats["active_matches"] += 1
+
+
             confirmations = (
                 best_track.get(
                     "confirmations",
                     1
                 )
                 + 1
+            )
+
+
+            detector_observations = (
+                best_track.get("detector_observations", 1)
+                + 1
+            )
+
+
+            appearance_embedding = update_appearance_prototype(
+                best_track.get("appearance_embedding"),
+                appearance_observation
+            )
+
+
+            appearance_gallery = update_appearance_gallery(
+                best_track.get("appearance_gallery", []),
+                appearance_observation
             )
 
 
@@ -1237,9 +1394,9 @@ def update_tracks_with_detections(
             # Majority label wins
             # ----------------------------------------------
 
-            final_label = max(
+            final_label = select_consensus_label(
                 label_votes,
-                key=label_votes.get
+                new_label
             )
 
 
@@ -1257,7 +1414,25 @@ def update_tracks_with_detections(
             next_track_id += 1
 
 
+            runtime_stats["new_tracks_created"] += 1
+
+
             confirmations = 1
+
+
+            detector_observations = 1
+
+
+            appearance_embedding = update_appearance_prototype(
+                None,
+                appearance_observation
+            )
+
+
+            appearance_gallery = update_appearance_gallery(
+                [],
+                appearance_observation
+            )
 
 
             label_votes = {
@@ -1274,9 +1449,25 @@ def update_tracks_with_detections(
         # Fresh detector box resets optical-flow drift
         # --------------------------------------------------
 
+        reconciled_box = new_box
+
+
+        if (
+            best_track is not None
+            and best_score >= 0.30
+            and not recovered_from_lost
+        ):
+
+            reconciled_box = select_reconciled_box(
+                new_box,
+                best_track["box"],
+                detection_age_frames
+            )
+
+
         points = get_points_inside_box(
             gray_image,
-            new_box
+            reconciled_box
         )
 
 
@@ -1297,7 +1488,7 @@ def update_tracks_with_detections(
                 confidence,
 
             "box":
-                new_box,
+                reconciled_box,
 
             "points":
                 points,
@@ -1305,8 +1496,26 @@ def update_tracks_with_detections(
             "confirmations":
                 confirmations,
 
+            "detector_observations":
+                detector_observations,
+
             "label_votes":
                 label_votes,
+
+            "appearance_embedding":
+                appearance_embedding,
+
+            "appearance_gallery":
+                appearance_gallery,
+
+            "evidence_crop":
+                detection.get("evidence_crop"),
+
+            "evidence_frame":
+                detection.get("evidence_frame", current_frame_number),
+
+            "evidence_confidence":
+                detection.get("evidence_confidence", confidence),
 
             "missed_scans":
                 0,
@@ -1314,6 +1523,15 @@ def update_tracks_with_detections(
             "fresh_detection":
                 True
         })
+
+
+    if recovered_track_ids:
+
+        lost_tracks = [
+            track
+            for track in lost_tracks
+            if track["id"] not in recovered_track_ids
+        ]
 
 
     # ==================================================
@@ -1342,6 +1560,12 @@ def update_tracks_with_detections(
         ] = False
 
 
+        old_track["detector_observations"] = (
+            old_track.get("detector_observations", 1)
+            + 1
+        )
+
+
         if (
             old_track["missed_scans"]
             <= MAX_MISSED_SCANS
@@ -1356,6 +1580,14 @@ def update_tracks_with_detections(
             updated_tracks.append(
                 old_track
             )
+
+
+        else:
+
+            lost_track = old_track.copy()
+            lost_track["lost_at_frame"] = current_frame_number
+            lost_tracks.append(lost_track)
+            runtime_stats["tracks_expired"] += 1
 
 
     tracks = updated_tracks
@@ -1642,15 +1874,55 @@ def get_trusted_tracks():
 
     for track in tracks:
 
+        required_confirmations = MEMORY_CONFIRMATION_REQUIREMENTS.get(
+            track["object"],
+            MIN_CONFIRMATIONS
+        )
+
         # Must have enough independent detections
         if (
             track.get(
                 "confirmations",
                 0
             )
-            < MIN_CONFIRMATIONS
+            < required_confirmations
         ):
 
+            continue
+
+
+        detector_observations = max(
+            1,
+            track.get("detector_observations", 1)
+        )
+
+
+        hit_ratio = (
+            track.get("confirmations", 0)
+            / detector_observations
+        )
+
+
+        if hit_ratio < MIN_MEMORY_HIT_RATIO:
+            continue
+
+
+        winning_votes = max(
+            track.get("label_votes", {track["object"]: 0}).values()
+        )
+
+
+        label_stability = (
+            winning_votes
+            / max(1, track.get("confirmations", 0))
+        )
+
+
+        if label_stability < MIN_MEMORY_LABEL_STABILITY:
+            continue
+
+
+        if track.get("appearance_embedding") is None:
             continue
 
 
@@ -1715,14 +1987,14 @@ while True:
     # Retrieve asynchronous detector result
     # --------------------------------------------------
 
-    new_detections = None
+    detection_result = None
 
 
     with lock:
 
         if pending_detections is not None:
 
-            new_detections = (
+            detection_result = (
                 pending_detections
             )
 
@@ -1736,17 +2008,91 @@ while True:
     # Reconcile fresh detections with tracks
     # --------------------------------------------------
 
-    if new_detections is not None:
+    if detection_result is not None:
 
-        update_tracks_with_detections(
-
-            new_detections,
-
-            current_gray
+        result_age = calculate_result_age(
+            frame_number,
+            detection_result["source_frame_number"]
         )
 
 
-        detector_updated = True
+        last_detection_age = result_age
+
+
+        if should_accept_result(
+            result_age,
+            MAX_DETECTION_RESULT_AGE
+        ):
+
+            runtime_stats["detector_results_accepted"] += 1
+
+            detections_to_reconcile = detection_result[
+                "detections"
+            ]
+
+
+            if result_age > 0:
+
+                (
+                    detections_to_reconcile,
+                    last_motion_compensation
+                ) = transport_detections(
+
+                    detection_result["source_gray"],
+
+                    current_gray,
+
+                    detections_to_reconcile
+                )
+
+
+                runtime_stats["motion_aligned"] += (
+                    last_motion_compensation["successful"]
+                )
+
+
+            else:
+
+                last_motion_compensation = {
+                    "successful": 0,
+                    "total": len(detections_to_reconcile)
+                }
+
+            update_tracks_with_detections(
+
+                detections_to_reconcile,
+
+                current_gray,
+
+                detection_age_frames=result_age,
+
+                current_frame_number=frame_number
+            )
+
+
+            runtime_stats["detections_received"] += len(
+                detections_to_reconcile
+            )
+
+
+            runtime_stats["appearance_embeddings_received"] += sum(
+                detection.get("appearance_embedding") is not None
+                for detection in detections_to_reconcile
+            )
+
+
+            detector_updated = True
+
+
+        else:
+
+            runtime_stats["detector_results_stale"] += 1
+
+            print(
+                "Discarding stale detection result:",
+                result_age,
+                "frames old"
+            )
 
 
     # --------------------------------------------------
@@ -1785,6 +2131,9 @@ while True:
         detection_running = True
 
 
+        runtime_stats["detector_jobs_started"] += 1
+
+
         detection_thread = (
             threading.Thread(
 
@@ -1792,6 +2141,7 @@ while True:
 
                 args=(
                     frame.copy(),
+                    frame_number
                 ),
 
                 daemon=True
@@ -1961,6 +2311,60 @@ while True:
 
 
     # --------------------------------------------------
+    # Last asynchronous result age
+    # --------------------------------------------------
+
+    if last_detection_age is not None:
+
+        cv2.putText(
+
+            frame,
+
+            f"Detector age: {last_detection_age} frames",
+
+            (
+                20,
+                95
+            ),
+
+            cv2.FONT_HERSHEY_SIMPLEX,
+
+            0.55,
+
+            (0, 255, 255),
+
+            1
+        )
+
+
+    if last_motion_compensation is not None:
+
+        cv2.putText(
+
+            frame,
+
+            (
+                "Motion aligned: "
+                f"{last_motion_compensation['successful']}/"
+                f"{last_motion_compensation['total']}"
+            ),
+
+            (
+                20,
+                120
+            ),
+
+            cv2.FONT_HERSHEY_SIMPLEX,
+
+            0.55,
+
+            (0, 255, 255),
+
+            1
+        )
+
+
+    # --------------------------------------------------
     # Scanning indicator
     # --------------------------------------------------
 
@@ -2049,10 +2453,19 @@ if not memory:
 
 else:
 
-    for track_id, data in memory.items():
+    for memory_id, data in memory.items():
 
         print(
-            f"ID:{track_id}"
+            f"Memory ID:{memory_id}"
+        )
+
+        print(
+            f"  Track IDs: {data.get('track_ids', [])}"
+        )
+
+        print(
+            f"  Appearance views: "
+            f"{len(data.get('appearance_gallery', []))}"
         )
 
         print(
@@ -2092,6 +2505,77 @@ else:
         print(
             "-" * 40
         )
+
+
+print(
+    "=" * 70
+)
+
+
+print(
+    "BHASKARA TRACKING DIAGNOSTICS"
+)
+
+
+print(
+    "=" * 70
+)
+
+
+for statistic_name, statistic_value in runtime_stats.items():
+
+    print(
+        f"{statistic_name}: {statistic_value}"
+    )
+
+
+for statistic_name, statistic_value in get_memory_stats().items():
+
+    print(
+        f"memory_{statistic_name}: {statistic_value}"
+    )
+
+
+print(
+    f"active_tracks_at_end: {len(tracks)}"
+)
+
+
+print(
+    f"lost_tracks_at_end: {len(lost_tracks)}"
+)
+
+
+print(
+    f"memory_entries_at_end: {len(memory)}"
+)
+
+
+audit_diagnostics = runtime_stats.copy()
+
+
+for statistic_name, statistic_value in get_memory_stats().items():
+    audit_diagnostics[f"memory_{statistic_name}"] = statistic_value
+
+
+audit_diagnostics["active_tracks_at_end"] = len(tracks)
+audit_diagnostics["lost_tracks_at_end"] = len(lost_tracks)
+audit_diagnostics["memory_entries_at_end"] = len(memory)
+
+
+audit_summary_path = write_audit_summary(
+    audit_diagnostics
+)
+
+
+print(
+    f"identity_audit: {get_audit_run_directory()}"
+)
+
+
+print(
+    f"identity_audit_summary: {audit_summary_path}"
+)
 
 
 print(

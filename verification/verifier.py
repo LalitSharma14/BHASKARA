@@ -4,6 +4,7 @@
 # --------------------------------------------------
 
 import torch
+import torch.nn.functional as F
 from PIL import Image
 
 from transformers import (
@@ -147,7 +148,66 @@ def get_description(label):
 
 
 # --------------------------------------------------
-# 5. Main verification function
+# 5. Batched appearance embeddings
+# --------------------------------------------------
+
+def get_image_embeddings(images):
+    """Return normalized SigLIP image embeddings for PIL images.
+
+    Detection crops are processed as one batch so appearance-based identity
+    does not require a separate model or one inference call per object.
+    """
+
+    if not images:
+        return []
+
+    prepared_images = [
+        image.convert("RGB")
+        for image in images
+    ]
+
+    inputs = processor(
+        images=prepared_images,
+        return_tensors="pt"
+    )
+
+    inputs = {
+        key: value.to(device)
+        for key, value in inputs.items()
+    }
+
+    with torch.no_grad():
+
+        if hasattr(model, "get_image_features"):
+            embeddings = model.get_image_features(**inputs)
+
+        else:
+            outputs = model(**inputs)
+            embeddings = outputs.image_embeds
+
+    if hasattr(embeddings, "pooler_output"):
+        embeddings = embeddings.pooler_output
+
+    elif hasattr(embeddings, "image_embeds"):
+        embeddings = embeddings.image_embeds
+
+    elif not torch.is_tensor(embeddings):
+        embeddings = embeddings[0]
+
+    embeddings = F.normalize(
+        embeddings,
+        p=2,
+        dim=-1
+    )
+
+    return [
+        embedding.detach().cpu().numpy()
+        for embedding in embeddings
+    ]
+
+
+# --------------------------------------------------
+# 6. Main verification function
 # --------------------------------------------------
 
 def verify_candidates(
