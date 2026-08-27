@@ -10,6 +10,9 @@
 # + Trusted Memory
 # --------------------------------------------------
 
+import argparse
+import time
+
 import cv2
 import threading
 import numpy as np
@@ -45,6 +48,10 @@ from tracking.detection_timing import (
     should_accept_result
 )
 from tracking.motion_compensation import transport_detections
+from tracking.evaluation_schedule import (
+    scheduled_evaluation_frames,
+    should_schedule_evaluation_frame,
+)
 
 
 # ==================================================
@@ -52,6 +59,33 @@ from tracking.motion_compensation import transport_detections
 # ==================================================
 
 VIDEO_PATH = "videos/room.mp4"
+
+
+argument_parser = argparse.ArgumentParser(
+    description="BHASKARA video detection and object-memory pipeline"
+)
+argument_parser.add_argument(
+    "--evaluation",
+    action="store_true",
+    help="use a deterministic synchronous detector schedule",
+)
+argument_parser.add_argument(
+    "--evaluation-interval",
+    type=int,
+    default=15,
+    help="fixed detector interval in evaluation mode (default: 15 frames)",
+)
+argument_parser.add_argument(
+    "--no-display",
+    action="store_true",
+    help="disable the OpenCV preview window",
+)
+arguments = argument_parser.parse_args()
+
+
+EVALUATION_MODE = arguments.evaluation
+EVALUATION_INTERVAL = max(1, arguments.evaluation_interval)
+DISPLAY_ENABLED = not arguments.no_display and not EVALUATION_MODE
 
 
 # Run Grounding DINO periodically
@@ -320,6 +354,11 @@ fps = video.get(
 )
 
 
+total_video_frames = int(
+    video.get(cv2.CAP_PROP_FRAME_COUNT)
+)
+
+
 if fps <= 0:
     fps = 30
 
@@ -334,6 +373,16 @@ print(
     "Video FPS:",
     round(fps, 2)
 )
+
+
+print(
+    "Run mode:",
+    "deterministic evaluation" if EVALUATION_MODE else "asynchronous preview"
+)
+
+
+if EVALUATION_MODE:
+    print("Evaluation detector interval:", EVALUATION_INTERVAL)
 
 
 # ==================================================
@@ -363,6 +412,9 @@ next_track_id = 1
 
 
 runtime_stats = {
+    "evaluation_mode": EVALUATION_MODE,
+    "evaluation_interval": EVALUATION_INTERVAL if EVALUATION_MODE else None,
+    "video_total_frames": total_video_frames,
     "detector_jobs_started": 0,
     "detector_results_accepted": 0,
     "detector_results_stale": 0,
@@ -380,11 +432,21 @@ runtime_stats = {
     "new_tracks_created": 0,
     "tracks_expired": 0,
     "semantic_memory_verified": 0,
-    "semantic_memory_rejected": 0
+    "semantic_memory_rejected": 0,
+    "video_frames_processed": 0,
+    "detector_seconds_total": 0.0,
+    "detector_seconds_max": 0.0,
+    "appearance_seconds_total": 0.0,
+    "optical_flow_seconds_total": 0.0,
+    "reconciliation_seconds_total": 0.0,
+    "memory_seconds_total": 0.0
 }
 
 
 previous_gray = None
+
+
+run_started_at = time.perf_counter()
 
 
 # ==================================================
@@ -990,7 +1052,11 @@ def attach_appearance_embeddings(frame, detections, source_frame_number):
         return detections
 
     try:
+        appearance_started_at = time.perf_counter()
         embeddings = get_image_embeddings(crops)
+        runtime_stats["appearance_seconds_total"] += (
+            time.perf_counter() - appearance_started_at
+        )
 
         for (detection_index, embedding_key), embedding in zip(
             embedding_targets,
@@ -1020,6 +1086,9 @@ def run_detection(
     global detection_running
 
     global pending_detections
+
+
+    detector_started_at = time.perf_counter()
 
 
     try:
@@ -1164,6 +1233,13 @@ def run_detection(
 
 
     finally:
+
+        detector_seconds = time.perf_counter() - detector_started_at
+        runtime_stats["detector_seconds_total"] += detector_seconds
+        runtime_stats["detector_seconds_max"] = max(
+            runtime_stats["detector_seconds_max"],
+            detector_seconds,
+        )
 
         detection_running = False
 
@@ -2068,6 +2144,7 @@ while True:
 
 
     frame_number += 1
+    runtime_stats["video_frames_processed"] += 1
 
 
     current_gray = cv2.cvtColor(
@@ -2080,9 +2157,17 @@ while True:
     # Smooth current tracks
     # --------------------------------------------------
 
+    optical_flow_started_at = time.perf_counter()
+
+
     update_tracks_with_optical_flow(
         previous_gray,
         current_gray
+    )
+
+
+    runtime_stats["optical_flow_seconds_total"] += (
+        time.perf_counter() - optical_flow_started_at
     )
 
 
@@ -2161,6 +2246,9 @@ while True:
                     "total": len(detections_to_reconcile)
                 }
 
+            reconciliation_started_at = time.perf_counter()
+
+
             update_tracks_with_detections(
 
                 detections_to_reconcile,
@@ -2170,6 +2258,11 @@ while True:
                 detection_age_frames=result_age,
 
                 current_frame_number=frame_number
+            )
+
+
+            runtime_stats["reconciliation_seconds_total"] += (
+                time.perf_counter() - reconciliation_started_at
             )
 
 
@@ -2211,6 +2304,8 @@ while True:
 
         if trusted_tracks:
 
+            memory_started_at = time.perf_counter()
+
             update_memory(
 
                 trusted_tracks,
@@ -2218,18 +2313,33 @@ while True:
                 frame_number
             )
 
+            runtime_stats["memory_seconds_total"] += (
+                time.perf_counter() - memory_started_at
+            )
+
 
     # --------------------------------------------------
     # Start next asynchronous scan
     # --------------------------------------------------
 
-    if (
-        frame_number
-        % PROCESS_EVERY
-        == 0
+    evaluation_scan_due = (
+        EVALUATION_MODE
+        and should_schedule_evaluation_frame(
+            frame_number,
+            EVALUATION_INTERVAL,
+            total_video_frames,
+        )
+    )
 
+
+    asynchronous_scan_due = (
+        not EVALUATION_MODE
+        and frame_number % PROCESS_EVERY == 0
         and not detection_running
-    ):
+    )
+
+
+    if evaluation_scan_due or asynchronous_scan_due:
 
         detection_running = True
 
@@ -2237,22 +2347,31 @@ while True:
         runtime_stats["detector_jobs_started"] += 1
 
 
-        detection_thread = (
-            threading.Thread(
+        if EVALUATION_MODE:
 
-                target=run_detection,
-
-                args=(
-                    frame.copy(),
-                    frame_number
-                ),
-
-                daemon=True
+            run_detection(
+                frame.copy(),
+                frame_number
             )
-        )
 
 
-        detection_thread.start()
+        else:
+
+            detection_thread = (
+                threading.Thread(
+
+                    target=run_detection,
+
+                    args=(
+                        frame.copy(),
+                        frame_number
+                    ),
+
+                    daemon=True
+                )
+            )
+
+            detection_thread.start()
 
 
     # ==================================================
@@ -2494,12 +2613,14 @@ while True:
         )
 
 
-    cv2.imshow(
+    if DISPLAY_ENABLED:
 
-        "BHASKARA - Reconciled Tracking",
+        cv2.imshow(
 
-        frame
-    )
+            "BHASKARA - Reconciled Tracking",
+
+            frame
+        )
 
 
     previous_gray = (
@@ -2507,9 +2628,14 @@ while True:
     )
 
 
-    key = cv2.waitKey(
-        delay
-    ) & 0xFF
+    key = -1
+
+
+    if DISPLAY_ENABLED:
+
+        key = cv2.waitKey(
+            delay
+        ) & 0xFF
 
 
     if key == ord("q"):
@@ -2522,7 +2648,8 @@ while True:
 
 video.release()
 
-cv2.destroyAllWindows()
+if DISPLAY_ENABLED:
+    cv2.destroyAllWindows()
 
 
 # ==================================================
@@ -2625,6 +2752,22 @@ print(
 )
 
 
+runtime_stats["run_seconds_total"] = time.perf_counter() - run_started_at
+runtime_stats["detector_seconds_average"] = (
+    runtime_stats["detector_seconds_total"]
+    / max(1, runtime_stats["detector_jobs_started"])
+)
+
+
+if EVALUATION_MODE:
+    runtime_stats["evaluation_expected_jobs"] = len(
+        scheduled_evaluation_frames(
+            total_video_frames,
+            EVALUATION_INTERVAL,
+        )
+    )
+
+
 for statistic_name, statistic_value in runtime_stats.items():
 
     print(
@@ -2655,6 +2798,15 @@ print(
 
 
 audit_diagnostics = runtime_stats.copy()
+
+
+if EVALUATION_MODE:
+    audit_diagnostics["evaluation_source_frames"] = (
+        scheduled_evaluation_frames(
+            total_video_frames,
+            EVALUATION_INTERVAL,
+        )
+    )
 
 
 for statistic_name, statistic_value in get_memory_stats().items():
