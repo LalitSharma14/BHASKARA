@@ -8,6 +8,11 @@ merge semantically unrelated objects.
 import numpy as np
 from scipy.optimize import linear_sum_assignment
 
+from tracking.appearance_quality import (
+    geometry_is_compatible,
+    required_identity_similarity,
+)
+
 
 COMPATIBLE_LABEL_GROUPS = (
     frozenset({"bed", "desk"}),
@@ -197,6 +202,37 @@ def best_appearance_similarity(observation, identity):
     return max(similarities) if similarities else None
 
 
+def identity_appearance_similarity(observation, identity):
+    """Return object-focused similarity with context used only as support.
+
+    A high context score can never rescue a weak tight-object score. This is
+    important in a single-room video where unrelated objects share a bed,
+    wall, or floor background. Context also never penalizes a strong object
+    match because it changes substantially as the camera viewpoint changes.
+    """
+
+    tight_similarity = best_appearance_similarity(
+        observation.get("appearance_embedding"),
+        identity,
+    )
+    if tight_similarity is None:
+        return None
+
+    context_identity = {
+        "appearance_embedding": identity.get("context_embedding"),
+        "appearance_gallery": identity.get("context_gallery", []),
+    }
+    context_similarity = best_appearance_similarity(
+        observation.get("context_embedding"),
+        context_identity,
+    )
+    if context_similarity is None:
+        return tight_similarity
+
+    context_support = max(0.0, context_similarity - tight_similarity)
+    return min(1.0, tight_similarity + context_support * 0.05)
+
+
 def calculate_identity_score(detection, track, frame_diagonal):
     """Combine spatial/motion evidence with crop appearance evidence."""
 
@@ -211,10 +247,10 @@ def calculate_identity_score(detection, track, frame_diagonal):
     if spatial_score <= 0:
         return 0.0
 
-    appearance = best_appearance_similarity(
-        detection.get("appearance_embedding"),
-        track,
-    )
+    if not geometry_is_compatible(detection, track):
+        return 0.0
+
+    appearance = identity_appearance_similarity(detection, track)
 
     if appearance is None:
         return spatial_score
@@ -439,10 +475,10 @@ def find_lost_track_assignments(
 
             diagnostics["same_label_comparisons"] += 1
 
-            appearance = best_appearance_similarity(
-                detection.get("appearance_embedding"),
-                track,
-            )
+            if not geometry_is_compatible(detection, track):
+                continue
+
+            appearance = identity_appearance_similarity(detection, track)
 
             if appearance is None:
                 continue
@@ -452,7 +488,11 @@ def find_lost_track_assignments(
                 []
             ).append(appearance)
 
-            if appearance < minimum_similarity:
+            effective_minimum = required_identity_similarity(
+                detection,
+                minimum_similarity,
+            )
+            if appearance < effective_minimum:
                 continue
 
             diagnostics["above_threshold"] += 1

@@ -12,7 +12,9 @@ from tracking.reconciliation import (
     select_consensus_label,
     update_appearance_prototype,
     update_appearance_gallery,
+    identity_appearance_similarity,
 )
+from tracking.appearance_quality import geometry_is_compatible
 
 
 FRAME_DIAGONAL_1080P = (1920 ** 2 + 1080 ** 2) ** 0.5
@@ -274,6 +276,60 @@ class GlobalAssignmentTests(unittest.TestCase):
 
 
 class AppearanceTests(unittest.TestCase):
+    def test_context_cannot_rescue_different_object_crop(self):
+        observation = {
+            "appearance_embedding": [0.0, 1.0],
+            "context_embedding": [1.0, 0.0],
+        }
+        identity = {
+            "appearance_embedding": [1.0, 0.0],
+            "appearance_gallery": [],
+            "context_embedding": [1.0, 0.0],
+            "context_gallery": [],
+        }
+        similarity = identity_appearance_similarity(observation, identity)
+        self.assertLess(similarity, 0.20)
+
+    def test_changed_context_does_not_penalize_strong_object_match(self):
+        observation = {
+            "appearance_embedding": [1.0, 0.0, 0.0],
+            "context_embedding": [0.0, 1.0, 0.0],
+        }
+        identity = {
+            "appearance_embedding": [0.999, 0.001, 0.0],
+            "appearance_gallery": [],
+            "context_embedding": [0.0, 0.0, 1.0],
+            "context_gallery": [],
+        }
+        tight_similarity = best_appearance_similarity(
+            observation["appearance_embedding"],
+            identity,
+        )
+        combined_similarity = identity_appearance_similarity(
+            observation,
+            identity,
+        )
+        self.assertAlmostEqual(combined_similarity, tight_similarity)
+
+    def test_context_can_only_add_a_small_supporting_boost(self):
+        observation = {
+            "appearance_embedding": [0.8, 0.6],
+            "context_embedding": [1.0, 0.0],
+        }
+        identity = {
+            "appearance_embedding": [1.0, 0.0],
+            "appearance_gallery": [],
+            "context_embedding": [1.0, 0.0],
+            "context_gallery": [],
+        }
+        similarity = identity_appearance_similarity(observation, identity)
+        self.assertAlmostEqual(similarity, 0.81, places=5)
+
+    def test_severe_aspect_change_is_not_same_identity(self):
+        observation = {"appearance_aspect_ratio": 0.2}
+        identity = {"appearance_aspect_ratio": 2.0}
+        self.assertFalse(geometry_is_compatible(observation, identity))
+
     def test_cosine_similarity_distinguishes_identity(self):
         self.assertAlmostEqual(cosine_similarity([1, 0], [1, 0]), 1.0)
         self.assertAlmostEqual(cosine_similarity([1, 0], [0, 1]), 0.0)

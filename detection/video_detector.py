@@ -37,6 +37,7 @@ from tracking.reconciliation import (
     update_appearance_gallery,
     update_appearance_prototype
 )
+from tracking.appearance_quality import describe_crop
 from tracking.detection_timing import (
     calculate_result_age,
     select_reconciled_box,
@@ -942,18 +943,34 @@ def verify_if_needed(
 # ==================================================
 
 def attach_appearance_embeddings(frame, detections, source_frame_number):
-    """Attach one normalized SigLIP embedding to each valid detection crop."""
+    """Attach one object-focused embedding to each reliable detection crop.
+
+    Context fields remain optional for schema compatibility, but context crops
+    are not embedded because they doubled SigLIP work and reduced detector
+    throughput without providing enough identity value.
+    """
 
     frame_height, frame_width = frame.shape[:2]
     crops = []
-    detection_indexes = []
+    embedding_targets = []
 
     for index, detection in enumerate(detections):
-        x1, y1, x2, y2 = detection["box"]
-        x1 = max(0, min(int(x1), frame_width - 1))
-        y1 = max(0, min(int(y1), frame_height - 1))
-        x2 = max(0, min(int(x2), frame_width))
-        y2 = max(0, min(int(y2), frame_height))
+        description = describe_crop(
+            detection["box"],
+            frame_width,
+            frame_height,
+        )
+        x1, y1, x2, y2 = description["box"]
+
+        detection["appearance_quality"] = description["quality"]
+        detection["appearance_aspect_ratio"] = description["aspect_ratio"]
+        detection["appearance_tiny"] = description["tiny"]
+        detection["appearance_touches_edge"] = description["touches_edge"]
+        detection["context_embedding"] = None
+
+        if not description["valid"]:
+            detection["appearance_embedding"] = None
+            continue
 
         crop = frame[y1:y2, x1:x2]
         if crop.size == 0:
@@ -962,7 +979,8 @@ def attach_appearance_embeddings(frame, detections, source_frame_number):
 
         crop_rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
         crops.append(Image.fromarray(crop_rgb))
-        detection_indexes.append(index)
+        embedding_targets.append((index, "appearance_embedding"))
+
         detection["evidence_crop"] = crop.copy()
         detection["evidence_frame"] = source_frame_number
         detection["evidence_confidence"] = detection["confidence"]
@@ -973,17 +991,18 @@ def attach_appearance_embeddings(frame, detections, source_frame_number):
     try:
         embeddings = get_image_embeddings(crops)
 
-        for detection_index, embedding in zip(
-            detection_indexes,
+        for (detection_index, embedding_key), embedding in zip(
+            embedding_targets,
             embeddings
         ):
-            detections[detection_index]["appearance_embedding"] = embedding
+            detections[detection_index][embedding_key] = embedding
 
     except Exception as error:
         print("Appearance embedding error:", error)
 
-        for detection_index in detection_indexes:
+        for detection_index, _embedding_key in embedding_targets:
             detections[detection_index]["appearance_embedding"] = None
+            detections[detection_index]["context_embedding"] = None
 
     return detections
 
@@ -1287,6 +1306,8 @@ def update_tracks_with_detections(
             "appearance_embedding"
         )
 
+        context_observation = detection.get("context_embedding")
+
 
         if not is_valid_box(
             new_box,
@@ -1368,6 +1389,16 @@ def update_tracks_with_detections(
                 appearance_observation
             )
 
+            context_embedding = update_appearance_prototype(
+                best_track.get("context_embedding"),
+                context_observation
+            )
+
+            context_gallery = update_appearance_gallery(
+                best_track.get("context_gallery", []),
+                context_observation
+            )
+
 
             # ----------------------------------------------
             # Label history
@@ -1432,6 +1463,16 @@ def update_tracks_with_detections(
             appearance_gallery = update_appearance_gallery(
                 [],
                 appearance_observation
+            )
+
+            context_embedding = update_appearance_prototype(
+                None,
+                context_observation
+            )
+
+            context_gallery = update_appearance_gallery(
+                [],
+                context_observation
             )
 
 
@@ -1507,6 +1548,24 @@ def update_tracks_with_detections(
 
             "appearance_gallery":
                 appearance_gallery,
+
+            "context_embedding":
+                context_embedding,
+
+            "context_gallery":
+                context_gallery,
+
+            "appearance_quality":
+                detection.get("appearance_quality", 0.0),
+
+            "appearance_aspect_ratio":
+                detection.get("appearance_aspect_ratio"),
+
+            "appearance_tiny":
+                detection.get("appearance_tiny", False),
+
+            "appearance_touches_edge":
+                detection.get("appearance_touches_edge", False),
 
             "evidence_crop":
                 detection.get("evidence_crop"),

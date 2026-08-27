@@ -4,9 +4,13 @@ from datetime import datetime
 
 from memory.identity_audit import IdentityAudit
 from tracking.reconciliation import (
-    best_appearance_similarity,
+    identity_appearance_similarity,
     update_appearance_gallery,
     update_appearance_prototype,
+)
+from tracking.appearance_quality import (
+    geometry_is_compatible,
+    required_identity_similarity,
 )
 
 
@@ -33,12 +37,16 @@ def _find_appearance_identity(track, minimum_similarity=0.94, minimum_margin=0.0
         if data["object"] != track["object"]:
             continue
 
-        similarity = best_appearance_similarity(
-            track_embedding,
-            data,
-        )
+        if not geometry_is_compatible(track, data):
+            continue
 
-        if similarity is not None and similarity >= minimum_similarity:
+        similarity = identity_appearance_similarity(track, data)
+
+        effective_minimum = required_identity_similarity(
+            track,
+            minimum_similarity,
+        )
+        if similarity is not None and similarity >= effective_minimum:
             candidates.append((similarity, memory_id))
 
     candidates.sort(reverse=True)
@@ -130,6 +138,19 @@ def update_memory(trusted_tracks, frame_number):
                 diversity_threshold=0.985,
             )
 
+        context_embedding = update_appearance_prototype(
+            previous.get("context_embedding"),
+            track.get("context_embedding"),
+            observation_weight=0.05,
+        )
+        context_gallery = list(previous.get("context_gallery", []))
+        context_gallery = update_appearance_gallery(
+            context_gallery,
+            track.get("context_embedding"),
+            maximum_size=12,
+            diversity_threshold=0.985,
+        )
+
         object_memory[memory_id] = {
             "memory_id": memory_id,
             "object": track["object"],
@@ -139,6 +160,14 @@ def update_memory(trusted_tracks, frame_number):
             "label_votes": track.get("label_votes", {}).copy(),
             "appearance_embedding": appearance_embedding,
             "appearance_gallery": appearance_gallery,
+            "context_embedding": context_embedding,
+            "context_gallery": context_gallery,
+            "appearance_aspect_ratio": track.get("appearance_aspect_ratio"),
+            "appearance_tiny": track.get("appearance_tiny", False),
+            "appearance_touches_edge": track.get(
+                "appearance_touches_edge",
+                False,
+            ),
             "track_ids": sorted(track_ids),
             "last_seen_frame": frame_number,
             "last_seen_time": current_time,
