@@ -29,6 +29,7 @@ from memory.object_memory import (
     get_audit_run_directory,
     write_audit_summary
 )
+from memory.semantic_gate import semantic_memory_decision
 
 from tracking.reconciliation import (
     find_global_assignments,
@@ -257,9 +258,10 @@ CONFUSION_GROUPS = {
 
     "charger": [
         "charger",
+        "power socket",
+        "power adapter",
         "usb cable",
         "wired earphones",
-        "fan"
     ],
 
     "usb cable": [
@@ -376,7 +378,9 @@ runtime_stats = {
     "reid_similarity_count": 0,
     "reid_similarity_max": 0.0,
     "new_tracks_created": 0,
-    "tracks_expired": 0
+    "tracks_expired": 0,
+    "semantic_memory_verified": 0,
+    "semantic_memory_rejected": 0
 }
 
 
@@ -818,7 +822,7 @@ def verify_if_needed(
 ):
 
     if object_name not in CONFUSION_GROUPS:
-        return object_name
+        return {"best_label": object_name, "best_score": None, "scores": {}}
 
 
     x1, y1, x2, y2 = box
@@ -857,7 +861,7 @@ def verify_if_needed(
 
 
     if not is_valid_box(box):
-        return object_name
+        return {"best_label": object_name, "best_score": None, "scores": {}}
 
 
     box_width = x2 - x1
@@ -905,7 +909,7 @@ def verify_if_needed(
 
 
     if crop.size == 0:
-        return object_name
+        return {"best_label": object_name, "best_score": None, "scores": {}}
 
 
     crop_rgb = cv2.cvtColor(
@@ -930,12 +934,9 @@ def verify_if_needed(
 
 
     if verification is None:
-        return object_name
+        return {"best_label": object_name, "best_score": None, "scores": {}}
 
-
-    return verification[
-        "best_label"
-    ]
+    return verification
 
 
 # ==================================================
@@ -1100,7 +1101,7 @@ def run_detection(
             # Selective SigLIP
             # ------------------------------------------
 
-            final_name = verify_if_needed(
+            semantic_verification = verify_if_needed(
 
                 frame_copy,
 
@@ -1111,7 +1112,7 @@ def run_detection(
 
 
             final_name = normalize_live_label(
-                final_name
+                semantic_verification["best_label"]
             )
 
 
@@ -1125,7 +1126,13 @@ def run_detection(
 
                 "confidence": confidence,
 
-                "box": box
+                "box": box,
+
+                "semantic_verified_label": final_name,
+
+                "semantic_score": semantic_verification.get("best_score"),
+
+                "semantic_margin": semantic_verification.get("margin")
             })
 
 
@@ -1567,6 +1574,31 @@ def update_tracks_with_detections(
             "appearance_touches_edge":
                 detection.get("appearance_touches_edge", False),
 
+            "semantic_verified_label":
+                detection.get("semantic_verified_label"),
+
+            "semantic_score":
+                detection.get("semantic_score"),
+
+            "semantic_margin":
+                detection.get("semantic_margin"),
+
+            "semantic_memory_approved":
+                bool(
+                    best_track
+                    and best_track.get("semantic_memory_approved", False)
+                    and best_track.get("semantic_memory_label") == final_label
+                    and detection.get("semantic_verified_label") == final_label
+                ),
+
+            "semantic_memory_label":
+                best_track.get("semantic_memory_label")
+                if (
+                    best_track
+                    and best_track.get("semantic_memory_label") == final_label
+                )
+                else None,
+
             "evidence_crop":
                 detection.get("evidence_crop"),
 
@@ -2000,6 +2032,18 @@ def get_trusted_tracks():
         ):
 
             continue
+
+
+        semantic_decision = semantic_memory_decision(track)
+
+
+        if not semantic_decision["accepted"]:
+            runtime_stats["semantic_memory_rejected"] += 1
+            continue
+
+
+        if semantic_decision["reason"] == "verified":
+            runtime_stats["semantic_memory_verified"] += 1
 
 
         trusted_tracks.append(

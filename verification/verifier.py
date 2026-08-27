@@ -65,6 +65,12 @@ LABEL_DESCRIPTIONS = {
     "charger":
         "a phone charger or charging adapter",
 
+    "power socket":
+        "a wall electrical power socket or wall outlet",
+
+    "power adapter":
+        "a removable electrical charging power adapter",
+
     "usb cable":
         "a USB charging or data cable",
 
@@ -361,11 +367,28 @@ def verify_candidates(
     )
 
 
+    ranked_scores = sorted(
+        scores.values(),
+        reverse=True
+    )
+
+
+    second_best_score = (
+        ranked_scores[1]
+        if len(ranked_scores) > 1
+        else 0.0
+    )
+
+
     return {
 
         "best_label": best_label,
 
         "best_score": scores[best_label],
+
+        "second_best_score": second_best_score,
+
+        "margin": scores[best_label] - second_best_score,
 
         "scores": scores
     }
