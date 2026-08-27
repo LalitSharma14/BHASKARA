@@ -35,6 +35,7 @@ from memory.object_memory import (
 from memory.semantic_gate import semantic_memory_decision
 
 from tracking.reconciliation import (
+    diagnose_new_track_reason,
     find_global_assignments,
     find_lost_track_assignments,
     select_consensus_label,
@@ -52,6 +53,7 @@ from tracking.evaluation_schedule import (
     scheduled_evaluation_frames,
     should_schedule_evaluation_frame,
 )
+from tracking.flow_lifecycle import prepare_track_for_lost_pool
 
 
 # ==================================================
@@ -426,6 +428,8 @@ runtime_stats = {
     "reid_same_label_comparisons": 0,
     "reid_above_threshold": 0,
     "reid_ambiguous": 0,
+    "reid_recent_spatial_candidates": 0,
+    "reid_recent_spatial_assigned": 0,
     "reid_similarity_sum": 0.0,
     "reid_similarity_count": 0,
     "reid_similarity_max": 0.0,
@@ -441,6 +445,50 @@ runtime_stats = {
     "reconciliation_seconds_total": 0.0,
     "memory_seconds_total": 0.0
 }
+
+
+for structured_statistic in (
+    "reid_shape_rejections_by_label",
+    "reid_missing_appearance_by_label",
+    "reid_below_threshold_by_label",
+    "reid_similarity_buckets",
+    "reid_below_threshold_age_buckets",
+):
+    runtime_stats[structured_statistic] = {}
+
+
+runtime_stats["reid_below_threshold_tiny"] = 0
+runtime_stats["reid_below_threshold_edge"] = 0
+
+
+for fragmentation_reason in (
+    "no_compatible_active_track",
+    "active_spatial_gate",
+    "active_shape_gate",
+    "active_appearance_gate",
+    "active_score_below_threshold",
+    "active_assignment_conflict",
+    "lost_shape_gate",
+    "lost_missing_appearance",
+    "lost_appearance_gate",
+    "lost_ambiguity_or_assignment_conflict",
+):
+    runtime_stats[f"new_track_reason_{fragmentation_reason}"] = 0
+
+
+for optical_flow_statistic in (
+    "tracks_attempted",
+    "invalid_box",
+    "points_reinitialized",
+    "lk_failed",
+    "insufficient_points",
+    "drifted_outside_frame",
+    "collapsed_box",
+    "fallback_preserved",
+    "moved_to_lost",
+    "successful_updates",
+):
+    runtime_stats[f"optical_flow_{optical_flow_statistic}"] = 0
 
 
 previous_gray = None
@@ -1333,7 +1381,9 @@ def update_tracks_with_detections(
             frame_height
         ),
 
-        return_diagnostics=True
+        return_diagnostics=True,
+
+        current_frame_number=current_frame_number
     )
 
 
@@ -1344,6 +1394,36 @@ def update_tracks_with_detections(
         reid_diagnostics["above_threshold"]
     )
     runtime_stats["reid_ambiguous"] += reid_diagnostics["ambiguous"]
+    runtime_stats["reid_recent_spatial_candidates"] += (
+        reid_diagnostics["recent_spatial_candidates"]
+    )
+    runtime_stats["reid_recent_spatial_assigned"] += (
+        reid_diagnostics["recent_spatial_assigned"]
+    )
+
+
+    structured_reid_statistics = {
+        "shape_rejections_by_label": "reid_shape_rejections_by_label",
+        "missing_appearance_by_label": "reid_missing_appearance_by_label",
+        "below_threshold_by_label": "reid_below_threshold_by_label",
+        "similarity_buckets": "reid_similarity_buckets",
+        "below_threshold_age_buckets": "reid_below_threshold_age_buckets",
+    }
+
+
+    for diagnostic_name, runtime_name in structured_reid_statistics.items():
+        for key, count in reid_diagnostics[diagnostic_name].items():
+            runtime_stats[runtime_name][key] = (
+                runtime_stats[runtime_name].get(key, 0) + count
+            )
+
+
+    runtime_stats["reid_below_threshold_tiny"] += (
+        reid_diagnostics["below_threshold_tiny"]
+    )
+    runtime_stats["reid_below_threshold_edge"] += (
+        reid_diagnostics["below_threshold_edge"]
+    )
 
 
     for similarity in reid_diagnostics["best_similarities"]:
@@ -1519,6 +1599,23 @@ def update_tracks_with_detections(
         # ==================================================
 
         else:
+
+            fragmentation_reason = diagnose_new_track_reason(
+                detection,
+                tracks,
+                lost_tracks,
+                frame_diagonal,
+                lambda box: is_valid_box(
+                    box,
+                    frame_width,
+                    frame_height,
+                ),
+            )
+
+
+            runtime_stats[
+                f"new_track_reason_{fragmentation_reason}"
+            ] += 1
 
             track_id = (
                 next_track_id
@@ -1766,10 +1863,12 @@ def update_tracks_with_detections(
 
 def update_tracks_with_optical_flow(
     previous_gray_frame,
-    current_gray_frame
+    current_gray_frame,
+    current_frame_number=0
 ):
 
     global tracks
+    global lost_tracks
 
 
     if previous_gray_frame is None:
@@ -1784,7 +1883,25 @@ def update_tracks_with_optical_flow(
     valid_tracks = []
 
 
+    def preserve_in_lost_pool(track):
+        """Keep identity state when optical flow cannot provide safe motion."""
+
+        prepare_track_for_lost_pool(
+            track,
+            get_points_inside_box(
+                current_gray_frame,
+                track["box"],
+            ),
+            current_frame_number,
+        )
+        lost_tracks.append(track)
+        runtime_stats["optical_flow_fallback_preserved"] += 1
+        runtime_stats["optical_flow_moved_to_lost"] += 1
+
+
     for track in tracks:
+
+        runtime_stats["optical_flow_tracks_attempted"] += 1
 
         # Optical flow is NOT detector confirmation
         track[
@@ -1798,6 +1915,7 @@ def update_tracks_with_optical_flow(
             frame_height
         ):
 
+            runtime_stats["optical_flow_invalid_box"] += 1
             continue
 
 
@@ -1810,6 +1928,8 @@ def update_tracks_with_optical_flow(
             points is None
             or len(points) < 3
         ):
+
+            runtime_stats["optical_flow_points_reinitialized"] += 1
 
             track["points"] = (
                 get_points_inside_box(
@@ -1859,9 +1979,9 @@ def update_tracks_with_optical_flow(
             or status is None
         ):
 
-            valid_tracks.append(
-                track
-            )
+            runtime_stats["optical_flow_lk_failed"] += 1
+
+            preserve_in_lost_pool(track)
 
             continue
 
@@ -1889,6 +2009,8 @@ def update_tracks_with_optical_flow(
 
 
         if len(good_new) < 3:
+
+            runtime_stats["optical_flow_insufficient_points"] += 1
 
             track["points"] = (
                 get_points_inside_box(
@@ -1958,6 +2080,8 @@ def update_tracks_with_optical_flow(
             or new_y1 >= frame_height
         ):
 
+            runtime_stats["optical_flow_drifted_outside_frame"] += 1
+            preserve_in_lost_pool(track)
             continue
 
 
@@ -2005,6 +2129,8 @@ def update_tracks_with_optical_flow(
             frame_height
         ):
 
+            runtime_stats["optical_flow_collapsed_box"] += 1
+            preserve_in_lost_pool(track)
             continue
 
 
@@ -2025,6 +2151,9 @@ def update_tracks_with_optical_flow(
         valid_tracks.append(
             track
         )
+
+
+        runtime_stats["optical_flow_successful_updates"] += 1
 
 
     tracks = valid_tracks
@@ -2162,7 +2291,8 @@ while True:
 
     update_tracks_with_optical_flow(
         previous_gray,
-        current_gray
+        current_gray,
+        current_frame_number=frame_number
     )
 
 
