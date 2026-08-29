@@ -15,6 +15,9 @@ from tracking.sam2_tracking import (
     tentative_track_action,
     semantic_promotion_candidates,
     semantic_promotion_approved,
+    confirmed_track_action,
+    requires_edge_safe_enrollment,
+    touches_frame_edge,
 )
 
 
@@ -124,6 +127,23 @@ class Sam2TrackingTests(unittest.TestCase):
         self.assertFalse(semantic_promotion_approved("metal ruler", wrong))
         self.assertFalse(semantic_promotion_approved("metal ruler", weak))
         self.assertFalse(semantic_promotion_approved("metal ruler", ambiguous))
+
+    def test_confirmed_track_survives_short_detector_gap(self):
+        self.assertEqual(confirmed_track_action(False, 2), "keep")
+
+    def test_confirmed_track_retires_after_sustained_absence(self):
+        self.assertEqual(confirmed_track_action(False, 3), "retire")
+
+    def test_confirmed_match_resets_retirement_pressure(self):
+        self.assertEqual(confirmed_track_action(True, 0), "keep")
+
+    def test_id_card_is_edge_sensitive(self):
+        self.assertTrue(requires_edge_safe_enrollment("id card"))
+        self.assertFalse(requires_edge_safe_enrollment("fan"))
+
+    def test_bottom_edge_crop_is_detected(self):
+        self.assertTrue(touches_frame_edge((10, 90, 30, 100), (100, 100)))
+        self.assertFalse(touches_frame_edge((10, 10, 30, 30), (100, 100)))
 
 
 if __name__ == "__main__":

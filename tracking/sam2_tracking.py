@@ -26,7 +26,10 @@ OBJECT_LABELS = (
 
 SEMANTIC_PROMOTION_ALTERNATIVES = {
     "metal ruler": ("metal ruler", "lanyard", "ribbon", "strap"),
-    "id card": ("id card", "hanging air freshener", "product tag", "medal"),
+    "id card": (
+        "id card", "hanging air freshener", "product tag", "medal",
+        "floor tile", "tile grout pattern",
+    ),
     "usb cable": ("usb cable", "wired earphones", "strap", "cord"),
     "wired earphones": ("wired earphones", "usb cable", "lanyard", "cord"),
     "charger": ("charger", "power socket", "power adapter", "wall fixture"),
@@ -217,6 +220,26 @@ def eligible_new_detection(
     return box_width >= 20 and box_height >= 20 and area_ratio <= 0.80
 
 
+def requires_edge_safe_enrollment(label: str) -> bool:
+    """Small portable objects must not be enrolled from edge-truncated crops."""
+    return label in {
+        "id card", "keys", "usb cable", "wired earphones",
+        "wireless earbuds", "charger", "mobile phone", "remote control",
+    }
+
+
+def touches_frame_edge(
+    box: tuple[int, int, int, int],
+    frame_size: tuple[int, int],
+    margin_ratio: float = 0.02,
+) -> bool:
+    width, height = frame_size
+    margin_x = max(2, int(width * margin_ratio))
+    margin_y = max(2, int(height * margin_ratio))
+    x1, y1, x2, y2 = box
+    return x1 <= margin_x or y1 <= margin_y or x2 >= width - margin_x or y2 >= height - margin_y
+
+
 def tentative_track_action(
     confirmations: int,
     matched_same_label: bool,
@@ -230,3 +253,14 @@ def tentative_track_action(
     if not matched_same_label and missed_refreshes > maximum_missed_refreshes:
         return "discard"
     return "keep"
+
+
+def confirmed_track_action(
+    matched: bool,
+    missed_refreshes: int,
+    maximum_missed_refreshes: int = 2,
+) -> str:
+    """Retire confirmed SAM state after sustained detector absence."""
+    if matched:
+        return "keep"
+    return "retire" if missed_refreshes > maximum_missed_refreshes else "keep"

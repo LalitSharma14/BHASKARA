@@ -43,10 +43,30 @@ tentative track that misses that refresh is removed from SAM 2 state, preventing
 single-scan false positives from accumulating inference cost. Tentative and
 discarded tracks are never eligible for trusted object memory.
 
+Confirmed tracks are removed from active SAM 2 state after three consecutive
+detector-refresh misses. Their metadata remains in the report as `retired`, but
+SAM no longer spends GPU time propagating an object that has left the view.
+
 Before promotion, high-risk labels receive one class-specific SigLIP check
 against realistic look-alikes. For example, `metal ruler` is compared with
 `lanyard`, `ribbon`, and `strap`. A tentative track is removed immediately when
 its detector label does not win with sufficient score and margin.
+
+Small portable-object candidates touching a frame edge are rejected before
+enrollment; this specifically prevents bottom-edge floor-tile fragments from
+becoming `id card` tracks. The ID-card semantic alternatives also explicitly
+include floor tile and grout patterns.
+
+Tentative tracks created in the last partial interval receive one detector scan
+on the final frame. This allows a real late-appearing object such as a fan to be
+confirmed, while single-scan end-of-video candidates remain discarded.
+
+Video tensors and historical SAM 2 mask state are offloaded to CPU by default.
+This keeps enough VRAM available for Grounding DINO and SigLIP refreshes on a
+6 GB GPU. `--keep-sam-state-on-gpu` is available only for short performance
+experiments where the complete state is known to fit.
+Complete-video runs also use SAM 2's asynchronous frame loader so hundreds of
+resized video tensors are not decoded into RAM at initialization.
 
 Combined detector phrases such as `door cabinet shelf` are treated as
 ambiguous. The existing SigLIP verifier selects among the contained canonical

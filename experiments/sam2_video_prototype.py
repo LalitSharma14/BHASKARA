@@ -31,6 +31,9 @@ from tracking.sam2_tracking import (
     tentative_track_action,
     semantic_promotion_candidates,
     semantic_promotion_approved,
+    confirmed_track_action,
+    requires_edge_safe_enrollment,
+    touches_frame_edge,
 )
 
 
@@ -111,6 +114,17 @@ def parse_arguments() -> argparse.Namespace:
     )
     parser.add_argument("--refresh-min-iou", type=float, default=0.30)
     parser.add_argument("--new-track-confidence", type=float, default=0.30)
+    parser.add_argument(
+        "--confirmed-missed-refreshes",
+        type=int,
+        default=2,
+        help="retire confirmed SAM state after this many missed detector refreshes",
+    )
+    parser.add_argument(
+        "--keep-sam-state-on-gpu",
+        action="store_true",
+        help="faster for short clips but may exhaust VRAM on complete videos",
+    )
     return parser.parse_args()
 
 
@@ -173,7 +187,13 @@ def main() -> None:
             raise RuntimeError("Grounding DINO found no objects on the prompt frame")
 
         predictor = load_predictor(args.model, device)
-        state = predictor.init_state(video_path=str(frame_directory))
+        offload_sam_state = not args.keep_sam_state_on_gpu
+        state = predictor.init_state(
+            video_path=str(frame_directory),
+            offload_video_to_cpu=offload_sam_state,
+            offload_state_to_cpu=offload_sam_state,
+            async_loading_frames=offload_sam_state,
+        )
         labels: dict[int, str] = {}
         confidences: dict[int, float] = {}
         label_votes: dict[int, Counter[str]] = {}
@@ -255,6 +275,7 @@ def main() -> None:
                         "promoted": 0,
                         "discarded": 0,
                         "semantic_rejected": 0,
+                        "retired": 0,
                     }
                     matched_track_ids = set()
                     semantic_removals = []
@@ -329,6 +350,27 @@ def main() -> None:
                             end_boxes.pop(track_id, None)
                             event["discarded"] += 1
 
+                    active_ids = list(state["obj_ids"])
+                    for track_id in active_ids:
+                        if track_status.get(track_id) != "confirmed":
+                            continue
+                        if track_id in matched_track_ids:
+                            missed_refreshes[track_id] = 0
+                            continue
+                        missed_refreshes[track_id] += 1
+                        action = confirmed_track_action(
+                            False,
+                            missed_refreshes[track_id],
+                            maximum_missed_refreshes=args.confirmed_missed_refreshes,
+                        )
+                        if action == "retire":
+                            predictor.remove_object(
+                                state, track_id, strict=True, need_output=False
+                            )
+                            track_status[track_id] = "retired"
+                            end_boxes.pop(track_id, None)
+                            event["retired"] += 1
+
                     for detection_index in unmatched:
                         detection = refreshed[detection_index]
                         if duplicates_existing_track(detection, end_boxes, labels):
@@ -336,6 +378,11 @@ def main() -> None:
                             continue
                         if not eligible_new_detection(
                             detection, frame_size, args.new_track_confidence
+                        ):
+                            continue
+                        if (
+                            requires_edge_safe_enrollment(detection["object"])
+                            and touches_frame_edge(tuple(detection["box"]), frame_size)
                         ):
                             continue
                         track_id = next_track_id
@@ -353,12 +400,61 @@ def main() -> None:
                             obj_id=track_id,
                             box=np.asarray(detection["box"], dtype=np.float32),
                         )
+                        # Include this proposal immediately so a contained or
+                        # overlapping same-scan proposal cannot create another ID.
+                        end_boxes[track_id] = tuple(detection["box"])
                         event["enrolled"] += 1
                     refresh_events.append(event)
                     chunk_start = chunk_end + 1
 
+                final_tentative_ids = [
+                    track_id
+                    for track_id, status in track_status.items()
+                    if status == "tentative"
+                ]
+                final_frame = None
+                final_detections = []
+                final_assignments = {}
+                if final_tentative_ids:
+                    final_frame = read_prompt_frame(frame_directory, frame_count - 1)
+                    final_detections = resolve_detection_labels(
+                        final_frame, detect_objects(final_frame)
+                    )
+                    final_boxes = {
+                        observation["track_id"]: observation["box"]
+                        for observation in observations
+                        if observation["track_id"] in final_tentative_ids
+                        and observation["visible"]
+                        and observation["frame_index"] == frame_count - 1
+                    }
+                    final_assignments, _ = match_detections_to_tracks(
+                        final_boxes,
+                        final_detections,
+                        minimum_iou=args.refresh_min_iou,
+                    )
+
                 for track_id, status in list(track_status.items()):
                     if status == "tentative":
+                        detection_index = final_assignments.get(track_id)
+                        if (
+                            detection_index is not None
+                            and final_detections[detection_index]["object"] == labels[track_id]
+                        ):
+                            semantic = verify_semantic_promotion(
+                                final_frame, final_detections[detection_index]
+                            )
+                            semantic_events.append({
+                                "frame_index": frame_count - 1,
+                                "track_id": track_id,
+                                "detector_label": labels[track_id],
+                                "final_boundary": True,
+                                **semantic,
+                            })
+                            if semantic["approved"]:
+                                confirmations[track_id] += 1
+                                label_votes[track_id][labels[track_id]] += 1
+                                track_status[track_id] = "confirmed"
+                                continue
                         track_status[track_id] = "discarded"
                         final_tentatives_discarded += 1
 
@@ -367,6 +463,8 @@ def main() -> None:
         "video": args.video,
         "model": args.model,
         "device": device,
+        "sam_state_offloaded_to_cpu": offload_sam_state,
+        "sam_frames_loaded_asynchronously": offload_sam_state,
         "frame_count": frame_count,
         "fps": fps,
         "frame_size": frame_size,
