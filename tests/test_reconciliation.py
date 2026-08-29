@@ -7,6 +7,7 @@ from tracking.reconciliation import (
     cosine_similarity,
     calculate_iou,
     calculate_match_score,
+    diagnose_new_track_reason,
     find_global_assignments,
     find_lost_track_assignments,
     select_consensus_label,
@@ -329,6 +330,79 @@ class AppearanceTests(unittest.TestCase):
         observation = {"appearance_aspect_ratio": 0.2}
         identity = {"appearance_aspect_ratio": 2.0}
         self.assertFalse(geometry_is_compatible(observation, identity))
+
+
+class FragmentationDiagnosticTests(unittest.TestCase):
+    @staticmethod
+    def valid_box(box):
+        return box[2] > box[0] and box[3] > box[1]
+
+    def test_reports_no_compatible_active_track(self):
+        detection = {"object": "bottle", "box": (10, 10, 60, 100)}
+        tracks = [{"id": 1, "object": "door", "box": (10, 10, 60, 100)}]
+        reason = diagnose_new_track_reason(
+            detection, tracks, [], FRAME_DIAGONAL_1080P, self.valid_box
+        )
+        self.assertEqual(reason, "no_compatible_active_track")
+
+    def test_reports_active_spatial_gate(self):
+        detection = {"object": "bottle", "box": (10, 10, 60, 100)}
+        tracks = [{"id": 1, "object": "bottle", "box": (500, 500, 550, 590)}]
+        reason = diagnose_new_track_reason(
+            detection, tracks, [], FRAME_DIAGONAL_1080P, self.valid_box
+        )
+        self.assertEqual(reason, "active_spatial_gate")
+
+    def test_reports_active_appearance_gate(self):
+        detection = {
+            "object": "bottle",
+            "box": (10, 10, 60, 100),
+            "appearance_embedding": [1.0, 0.0],
+        }
+        tracks = [{
+            "id": 1,
+            "object": "bottle",
+            "box": (12, 12, 62, 102),
+            "appearance_embedding": [0.0, 1.0],
+        }]
+        reason = diagnose_new_track_reason(
+            detection, tracks, [], FRAME_DIAGONAL_1080P, self.valid_box
+        )
+        self.assertEqual(reason, "active_appearance_gate")
+
+    def test_reports_assignment_conflict_for_an_eligible_pair(self):
+        detection = {
+            "object": "bottle",
+            "box": (10, 10, 60, 100),
+            "appearance_embedding": [1.0, 0.0],
+        }
+        tracks = [{
+            "id": 1,
+            "object": "bottle",
+            "box": (12, 12, 62, 102),
+            "appearance_embedding": [1.0, 0.0],
+        }]
+        reason = diagnose_new_track_reason(
+            detection, tracks, [], FRAME_DIAGONAL_1080P, self.valid_box
+        )
+        self.assertEqual(reason, "active_assignment_conflict")
+
+    def test_reports_weak_lost_appearance(self):
+        detection = {
+            "object": "bottle",
+            "box": (10, 10, 60, 100),
+            "appearance_embedding": [1.0, 0.0],
+        }
+        lost = [{
+            "id": 7,
+            "object": "bottle",
+            "box": (300, 300, 350, 390),
+            "appearance_embedding": [0.8, 0.6],
+        }]
+        reason = diagnose_new_track_reason(
+            detection, [], lost, FRAME_DIAGONAL_1080P, self.valid_box
+        )
+        self.assertEqual(reason, "lost_appearance_gate")
 
     def test_cosine_similarity_distinguishes_identity(self):
         self.assertAlmostEqual(cosine_similarity([1, 0], [1, 0]), 1.0)

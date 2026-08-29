@@ -19,6 +19,110 @@ COMPATIBLE_LABEL_GROUPS = (
 )
 
 
+FLEXIBLE_SHAPE_LABELS = frozenset({
+    "clothes",
+    "keys",
+    "usb cable",
+    "wired earphones",
+    "charger",
+    "metal ruler",
+})
+
+
+def similarity_bucket(similarity):
+    """Return a stable diagnostic band for a cosine similarity."""
+
+    if similarity < 0.70:
+        return "below_0.70"
+    if similarity < 0.80:
+        return "0.70_to_0.80"
+    if similarity < 0.85:
+        return "0.80_to_0.85"
+    if similarity < 0.90:
+        return "0.85_to_0.90"
+    if similarity < 0.92:
+        return "0.90_to_0.92"
+    if similarity < 0.96:
+        return "0.92_to_0.96"
+    return "0.96_and_above"
+
+
+def track_age_bucket(age_frames):
+    """Return a diagnostic band for time spent in the lost pool."""
+
+    if age_frames is None:
+        return "unknown"
+    if age_frames <= 30:
+        return "0_to_30"
+    if age_frames <= 60:
+        return "31_to_60"
+    if age_frames <= 120:
+        return "61_to_120"
+    return "121_and_above"
+
+
+def increment_counter(mapping, key):
+    mapping[key] = mapping.get(key, 0) + 1
+
+
+def lost_geometry_is_compatible(detection, track):
+    """Use limited label-specific shape tolerance for lost-track recovery."""
+
+    minimum_ratio = (
+        0.20
+        if detection["object"] in FLEXIBLE_SHAPE_LABELS
+        else 0.35
+    )
+    return geometry_is_compatible(
+        detection,
+        track,
+        minimum_aspect_ratio=minimum_ratio,
+    )
+
+
+def has_strong_spatial_evidence(box1, box2):
+    """Return whether two boxes provide strong local continuity evidence."""
+
+    iou = calculate_iou(box1, box2)
+    containment = calculate_containment(box1, box2)
+    center1 = get_box_center(box1)
+    center2 = get_box_center(box2)
+    distance = (
+        (center1[0] - center2[0]) ** 2
+        + (center1[1] - center2[1]) ** 2
+    ) ** 0.5
+    reference_diagonal = max(get_box_diagonal(box1), get_box_diagonal(box2))
+    normalized_distance = (
+        distance / reference_diagonal if reference_diagonal > 0 else float("inf")
+    )
+    return (
+        iou >= 0.25
+        or (containment >= 0.75 and normalized_distance <= 0.35)
+    )
+
+
+def qualifies_for_recent_spatial_recovery(
+    detection,
+    track,
+    current_frame_number,
+    appearance,
+    minimum_similarity=0.85,
+    maximum_age_frames=30,
+):
+    """Return whether a recent lost identity has corroborating local evidence."""
+
+    if current_frame_number is None:
+        return False
+    age = current_frame_number - track.get("lost_at_frame", current_frame_number)
+    return (
+        0 <= age <= maximum_age_frames
+        and not detection.get("appearance_tiny", False)
+        and not detection.get("appearance_touches_edge", False)
+        and appearance >= minimum_similarity
+        and has_strong_spatial_evidence(detection["box"], track["box"])
+    )
+
+
 def calculate_iou(box1, box2):
     """Return intersection-over-union for two ``(x1, y1, x2, y2)`` boxes."""
 
@@ -267,6 +371,118 @@ def calculate_identity_score(detection, track, frame_diagonal):
     return spatial_score * 0.55 + max(0.0, appearance) * 0.45
 
 
+def diagnose_new_track_reason(
+    detection,
+    active_tracks,
+    lost_tracks,
+    frame_diagonal,
+    is_valid_box,
+    match_threshold=0.30,
+    lost_minimum_similarity=0.92,
+):
+    """Explain why an unmatched detection could not reuse an identity.
+
+    This function mirrors the matcher gates but never changes assignment
+    behavior. It returns one stable reason suitable for aggregate diagnostics.
+    """
+
+    valid_active = [
+        track for track in active_tracks if is_valid_box(track["box"])
+    ]
+    compatible_active = [
+        track
+        for track in valid_active
+        if are_labels_compatible(track["object"], detection["object"])
+    ]
+
+    active_reason = "no_compatible_active_track"
+    if compatible_active:
+        spatial_active = [
+            (track, calculate_match_score(
+                detection["box"],
+                track["box"],
+                detection["object"],
+                track["object"],
+                frame_diagonal,
+            ))
+            for track in compatible_active
+        ]
+        spatial_active = [pair for pair in spatial_active if pair[1] > 0]
+
+        if not spatial_active:
+            active_reason = "active_spatial_gate"
+        else:
+            shape_active = [
+                pair
+                for pair in spatial_active
+                if geometry_is_compatible(detection, pair[0])
+            ]
+            if not shape_active:
+                active_reason = "active_shape_gate"
+            else:
+                appearance_rejected = False
+                eligible_score = False
+                for track, spatial_score in shape_active:
+                    appearance = identity_appearance_similarity(detection, track)
+                    if appearance is None:
+                        score = spatial_score
+                    else:
+                        minimum = (
+                            0.50
+                            if detection["object"] == track["object"]
+                            else 0.70
+                        )
+                        if appearance < minimum:
+                            appearance_rejected = True
+                            continue
+                        score = spatial_score * 0.55 + appearance * 0.45
+                    eligible_score |= score >= match_threshold
+
+                if eligible_score:
+                    active_reason = "active_assignment_conflict"
+                elif appearance_rejected:
+                    active_reason = "active_appearance_gate"
+                else:
+                    active_reason = "active_score_below_threshold"
+
+    valid_lost = [
+        track
+        for track in lost_tracks
+        if is_valid_box(track["box"])
+        and track["object"] == detection["object"]
+    ]
+    if not valid_lost:
+        return active_reason
+
+    shape_lost = [
+        track
+        for track in valid_lost
+        if lost_geometry_is_compatible(detection, track)
+    ]
+    if not shape_lost:
+        return "lost_shape_gate"
+
+    similarities = [
+        identity_appearance_similarity(detection, track)
+        for track in shape_lost
+    ]
+    similarities = [value for value in similarities if value is not None]
+    if not similarities:
+        return "lost_missing_appearance"
+
+    effective_minimum = required_identity_similarity(
+        detection,
+        lost_minimum_similarity,
+    )
+    above_threshold = [
+        value for value in similarities if value >= effective_minimum
+    ]
+    if not above_threshold:
+        return "lost_appearance_gate"
+
+    return "lost_ambiguity_or_assignment_conflict"
+
+
 def calculate_match_score(new_box, old_box, new_label, old_label, frame_diagonal):
     """Calculate a gated, scale-aware physical-identity score.
 
@@ -446,6 +662,7 @@ def find_lost_track_assignments(
     minimum_similarity=0.92,
     minimum_margin=0.03,
     return_diagnostics=False,
+    current_frame_number=None,
 ):
     """Find conservative recovery matches for recently lost tracks.
 
@@ -461,6 +678,15 @@ def find_lost_track_assignments(
         "ambiguous": 0,
         "assigned": 0,
         "best_similarities": [],
+        "shape_rejections_by_label": {},
+        "missing_appearance_by_label": {},
+        "below_threshold_by_label": {},
+        "similarity_buckets": {},
+        "below_threshold_age_buckets": {},
+        "below_threshold_tiny": 0,
+        "below_threshold_edge": 0,
+        "recent_spatial_candidates": 0,
+        "recent_spatial_assigned": 0,
     }
 
     for detection_index, detection in enumerate(detections):
@@ -475,27 +701,31 @@ def find_lost_track_assignments(
 
             diagnostics["same_label_comparisons"] += 1
 
-            if not geometry_is_compatible(detection, track):
+            if not lost_geometry_is_compatible(detection, track):
+                increment_counter(
+                    diagnostics["shape_rejections_by_label"],
+                    detection["object"],
+                )
                 continue
 
             appearance = identity_appearance_similarity(detection, track)
 
             if appearance is None:
+                increment_counter(
+                    diagnostics["missing_appearance_by_label"],
+                    detection["object"],
+                )
                 continue
+
+            increment_counter(
+                diagnostics["similarity_buckets"],
+                similarity_bucket(appearance),
+            )
 
             similarities_by_detection.setdefault(
                 detection_index,
                 []
             ).append(appearance)
-
-            effective_minimum = required_identity_similarity(
-                detection,
-                minimum_similarity,
-            )
-            if appearance < effective_minimum:
-                continue
-
-            diagnostics["above_threshold"] += 1
 
             spatial_score = calculate_match_score(
                 detection["box"],
@@ -505,9 +735,53 @@ def find_lost_track_assignments(
                 frame_diagonal,
             )
 
+            recent_spatial_recovery = qualifies_for_recent_spatial_recovery(
+                detection,
+                track,
+                current_frame_number,
+                appearance,
+            )
+
+            effective_minimum = required_identity_similarity(
+                detection,
+                minimum_similarity,
+            )
+            if appearance < effective_minimum and not recent_spatial_recovery:
+                increment_counter(
+                    diagnostics["below_threshold_by_label"],
+                    detection["object"],
+                )
+                age_frames = (
+                    current_frame_number - track.get("lost_at_frame", current_frame_number)
+                    if current_frame_number is not None
+                    else None
+                )
+                increment_counter(
+                    diagnostics["below_threshold_age_buckets"],
+                    track_age_bucket(age_frames),
+                )
+                diagnostics["below_threshold_tiny"] += int(
+                    detection.get("appearance_tiny", False)
+                )
+                diagnostics["below_threshold_edge"] += int(
+                    detection.get("appearance_touches_edge", False)
+                )
+                continue
+
+            diagnostics["above_threshold"] += 1
+
+            if recent_spatial_recovery and appearance < effective_minimum:
+                diagnostics["recent_spatial_candidates"] += 1
+
             recovery_score = appearance * 0.85 + spatial_score * 0.15
             candidates.append(
-                (recovery_score, appearance, detection_index, track)
+                (
+                    recovery_score,
+                    appearance,
+                    detection_index,
+                    track,
+                    recent_spatial_recovery and appearance < effective_minimum,
+                )
             )
 
     diagnostics["best_similarities"] = [
@@ -531,7 +805,8 @@ def find_lost_track_assignments(
         best = detection_candidates[0]
         if len(detection_candidates) > 1:
             appearance_margin = best[1] - detection_candidates[1][1]
-            if appearance_margin < minimum_margin:
+            required_margin = 0.05 if best[4] else minimum_margin
+            if appearance_margin < required_margin:
                 diagnostics["ambiguous"] += 1
                 continue
 
@@ -541,11 +816,12 @@ def find_lost_track_assignments(
     assignments = {}
     used_track_ids = set()
 
-    for score, _appearance, detection_index, track in unambiguous_candidates:
+    for score, _appearance, detection_index, track, recent_spatial in unambiguous_candidates:
         if detection_index in assignments or track["id"] in used_track_ids:
             continue
         assignments[detection_index] = (track, score)
         used_track_ids.add(track["id"])
+        diagnostics["recent_spatial_assigned"] += int(recent_spatial)
 
     diagnostics["assigned"] = len(assignments)
 
