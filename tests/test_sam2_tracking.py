@@ -18,6 +18,8 @@ from tracking.sam2_tracking import (
     confirmed_track_action,
     requires_edge_safe_enrollment,
     touches_frame_edge,
+    find_persistent_identity,
+    update_persistent_identity,
 )
 
 
@@ -141,9 +143,101 @@ class Sam2TrackingTests(unittest.TestCase):
         self.assertTrue(requires_edge_safe_enrollment("id card"))
         self.assertFalse(requires_edge_safe_enrollment("fan"))
 
+    def test_uncertain_id_card_cannot_enter_trusted_memory(self):
+        result = {
+            "best_label": "id card",
+            "best_score": 0.61,
+            "margin": 0.28,
+        }
+        self.assertFalse(semantic_promotion_approved("id card", result))
+
+    def test_clear_id_card_can_enter_trusted_memory(self):
+        result = {
+            "best_label": "id card",
+            "best_score": 0.82,
+            "margin": 0.40,
+        }
+        self.assertTrue(semantic_promotion_approved("id card", result))
+
     def test_bottom_edge_crop_is_detected(self):
         self.assertTrue(touches_frame_edge((10, 90, 30, 100), (100, 100)))
         self.assertFalse(touches_frame_edge((10, 10, 30, 30), (100, 100)))
+
+    def test_returning_track_reuses_unambiguous_physical_identity(self):
+        identities = {
+            3: update_persistent_identity(None, {
+                "object": "clothes",
+                "appearance_embedding": [1.0, 0.0, 0.0],
+                "appearance_aspect_ratio": 0.5,
+            })
+        }
+        match = find_persistent_identity({
+            "object": "clothes",
+            "appearance_embedding": [0.999, 0.02, 0.0],
+            "appearance_aspect_ratio": 0.55,
+        }, identities)
+        self.assertEqual(match["memory_id"], 3)
+
+    def test_same_label_different_appearance_does_not_merge(self):
+        identities = {
+            3: update_persistent_identity(None, {
+                "object": "clothes",
+                "appearance_embedding": [1.0, 0.0],
+            })
+        }
+        match = find_persistent_identity({
+            "object": "clothes",
+            "appearance_embedding": [0.0, 1.0],
+        }, identities)
+        self.assertIsNone(match)
+
+    def test_authoritative_refinement_can_reuse_compatible_old_label(self):
+        identities = {
+            26: update_persistent_identity(None, {
+                "object": "medicine box",
+                "appearance_embedding": [1.0, 0.0, 0.0],
+                "appearance_aspect_ratio": 2.5,
+            })
+        }
+        observation = {
+            "object": "air conditioner",
+            "appearance_embedding": [0.999, 0.02, 0.0],
+            "appearance_aspect_ratio": 2.4,
+        }
+        self.assertIsNone(find_persistent_identity(observation, identities))
+        match = find_persistent_identity(
+            observation,
+            identities,
+            compatible_labels=("medicine box", "cabinet"),
+        )
+        self.assertEqual(match["memory_id"], 26)
+
+    def test_rejected_identity_reports_best_similarity(self):
+        identities = {
+            3: update_persistent_identity(None, {
+                "object": "clothes", "appearance_embedding": [1.0, 0.0]
+            })
+        }
+        match, diagnostics = find_persistent_identity({
+            "object": "clothes", "appearance_embedding": [0.8, 0.6]
+        }, identities, return_diagnostics=True)
+        self.assertIsNone(match)
+        self.assertEqual(diagnostics["reason"], "below_similarity")
+        self.assertAlmostEqual(diagnostics["best_similarity"], 0.8)
+
+    def test_ambiguous_identity_is_not_reused(self):
+        identities = {
+            3: update_persistent_identity(None, {
+                "object": "clothes", "appearance_embedding": [1.0, 0.0]
+            }),
+            4: update_persistent_identity(None, {
+                "object": "clothes", "appearance_embedding": [0.999, 0.01]
+            }),
+        }
+        match = find_persistent_identity({
+            "object": "clothes", "appearance_embedding": [1.0, 0.005]
+        }, identities)
+        self.assertIsNone(match)
 
 
 if __name__ == "__main__":

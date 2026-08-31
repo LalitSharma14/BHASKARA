@@ -23,9 +23,13 @@ def main() -> None:
     report = json.loads(Path(args.report).read_text(encoding="utf-8"))
     labels = {item["track_id"]: item["initial_label"] for item in report["tracks"]}
     statuses = {item["track_id"]: item.get("status", "confirmed") for item in report["tracks"]}
+    memory_ids = {item["track_id"]: item.get("memory_id") for item in report["tracks"]}
     observations = defaultdict(list)
     for observation in report["observations"]:
         observations[observation["frame_index"]].append(observation)
+    possible_observations = defaultdict(list)
+    for observation in report.get("possible_observations", []):
+        possible_observations[observation["frame_index"]].append(observation)
 
     capture = cv2.VideoCapture(args.video)
     width, height = report["frame_size"]
@@ -44,6 +48,19 @@ def main() -> None:
         if not ok:
             break
         visible_track_ids = []
+        for possible in possible_observations[frame_index]:
+            x1, y1, x2, y2 = possible["box"]
+            color = (0, 165, 255)
+            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+            cv2.putText(
+                frame,
+                f"POSSIBLE {possible['object']} - partial view",
+                (x1 + 5, max(28, y1 + 28)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                color,
+                2,
+            )
         for observation in observations[frame_index]:
             if statuses[observation["track_id"]] == "discarded":
                 continue
@@ -55,7 +72,7 @@ def main() -> None:
             cv2.rectangle(frame, (x1, y1), (x2, y2), color, 3)
             cv2.putText(
                 frame,
-                f"{track_id}",
+                f"M{memory_ids[track_id]} / T{track_id}" if memory_ids[track_id] else f"T{track_id}",
                 (x1 + 5, min(y2 - 5, y1 + 28)),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.9,
@@ -72,7 +89,12 @@ def main() -> None:
                 color = COLORS[(track_id - 1) % len(COLORS)]
                 cv2.putText(
                     frame,
-                    f"{'T-' if statuses[track_id] == 'tentative' else ''}ID {track_id}: {labels[track_id]}",
+                    (
+                        f"{'TENTATIVE ' if statuses[track_id] == 'tentative' else ''}"
+                        f"M{memory_ids[track_id]} / T{track_id}: {labels[track_id]}"
+                        if memory_ids[track_id]
+                        else f"TENTATIVE T{track_id}: {labels[track_id]}"
+                    ),
                     (18, 34 + row * 30),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.65,

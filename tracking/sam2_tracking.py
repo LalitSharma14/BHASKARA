@@ -13,6 +13,13 @@ from collections import Counter
 
 import numpy as np
 
+from tracking.appearance_quality import geometry_is_compatible, required_identity_similarity
+from tracking.reconciliation import (
+    identity_appearance_similarity,
+    update_appearance_gallery,
+    update_appearance_prototype,
+)
+
 
 OBJECT_LABELS = (
     "wired earphones", "wireless earbuds", "remote control", "mobile phone",
@@ -34,6 +41,14 @@ SEMANTIC_PROMOTION_ALTERNATIVES = {
     "wired earphones": ("wired earphones", "usb cable", "lanyard", "cord"),
     "charger": ("charger", "power socket", "power adapter", "wall fixture"),
     "keys": ("keys", "keychain", "metal ornament", "small tool"),
+}
+
+
+SEMANTIC_PROMOTION_THRESHOLDS = {
+    # Small rectangular crops are frequently shelf fragments, product tags,
+    # grout, or tiles. Require a substantially clearer semantic result before
+    # this portable identity is allowed into trusted memory.
+    "id card": (0.70, 0.25),
 }
 
 
@@ -94,10 +109,11 @@ def sorted_frame_paths(frame_directory: str | Path) -> list[Path]:
     return sorted(directory.glob("*.jpg"), key=lambda path: int(path.stem))
 
 
-def label_candidates(raw_label: str) -> list[str]:
+def label_candidates(raw_label: str, extra_labels=()) -> list[str]:
     """Extract all known labels from a Grounding DINO phrase."""
     text = raw_label.lower().strip()
-    return [label for label in OBJECT_LABELS if label in text]
+    vocabulary = list(dict.fromkeys((*OBJECT_LABELS, *extra_labels)))
+    return [label for label in vocabulary if label in text]
 
 
 def semantic_promotion_candidates(label: str) -> tuple[str, ...]:
@@ -111,6 +127,10 @@ def semantic_promotion_approved(
     minimum_score: float = 0.55,
     minimum_margin: float = 0.15,
 ) -> bool:
+    class_thresholds = SEMANTIC_PROMOTION_THRESHOLDS.get(detector_label)
+    if class_thresholds is not None:
+        minimum_score = max(minimum_score, class_thresholds[0])
+        minimum_margin = max(minimum_margin, class_thresholds[1])
     return (
         result.get("best_label") == detector_label
         and float(result.get("best_score", 0.0)) >= minimum_score
@@ -264,3 +284,97 @@ def confirmed_track_action(
     if matched:
         return "keep"
     return "retire" if missed_refreshes > maximum_missed_refreshes else "keep"
+
+
+def find_persistent_identity(
+    observation: dict,
+    identities: dict[int, dict],
+    minimum_similarity: float = 0.94,
+    minimum_margin: float = 0.03,
+    return_diagnostics: bool = False,
+    compatible_labels=(),
+) -> dict | None | tuple[dict | None, dict]:
+    """Return one unambiguous same-label physical identity.
+
+    A missing/poor embedding never falls back to label-only matching. This is
+    intentionally conservative: fragmentation is safer than a false memory
+    merge between two different physical objects.
+    """
+    diagnostics = {
+        "reason": "no_candidate",
+        "same_label_candidates": 0,
+        "geometry_candidates": 0,
+        "best_similarity": None,
+        "second_best_similarity": None,
+        "required_similarity": required_identity_similarity(
+            observation, minimum_similarity
+        ),
+    }
+    if observation.get("appearance_embedding") is None:
+        diagnostics["reason"] = "missing_embedding"
+        return (None, diagnostics) if return_diagnostics else None
+
+    accepted_labels = {observation.get("object"), *compatible_labels}
+    candidates = []
+    for memory_id, identity in identities.items():
+        if identity.get("object") not in accepted_labels:
+            continue
+        diagnostics["same_label_candidates"] += 1
+        if not geometry_is_compatible(observation, identity):
+            continue
+        diagnostics["geometry_candidates"] += 1
+        similarity = identity_appearance_similarity(observation, identity)
+        if similarity is not None:
+            candidates.append((float(similarity), memory_id))
+
+    candidates.sort(reverse=True)
+    if not candidates:
+        diagnostics["reason"] = (
+            "geometry_rejected"
+            if diagnostics["same_label_candidates"]
+            and not diagnostics["geometry_candidates"]
+            else "no_comparable_identity"
+        )
+        return (None, diagnostics) if return_diagnostics else None
+    diagnostics["best_similarity"] = candidates[0][0]
+    second_best = candidates[1][0] if len(candidates) > 1 else None
+    diagnostics["second_best_similarity"] = second_best
+    if candidates[0][0] < diagnostics["required_similarity"]:
+        diagnostics["reason"] = "below_similarity"
+        return (None, diagnostics) if return_diagnostics else None
+    if second_best is not None and candidates[0][0] - second_best < minimum_margin:
+        diagnostics["reason"] = "ambiguous_margin"
+        return (None, diagnostics) if return_diagnostics else None
+    diagnostics["reason"] = "matched"
+    result = {
+        "memory_id": candidates[0][1],
+        "similarity": candidates[0][0],
+        "second_best_similarity": second_best,
+        "margin": candidates[0][0] - second_best if second_best is not None else None,
+    }
+    return (result, diagnostics) if return_diagnostics else result
+
+
+def update_persistent_identity(identity: dict | None, observation: dict) -> dict:
+    """Create or conservatively update a physical identity appearance gallery."""
+    previous = identity or {}
+    embedding = observation.get("appearance_embedding")
+    gallery = update_appearance_gallery(
+        previous.get("appearance_gallery", []),
+        embedding,
+        maximum_size=12,
+        diversity_threshold=0.985,
+    )
+    return {
+        **previous,
+        "object": observation["object"],
+        "appearance_embedding": update_appearance_prototype(
+            previous.get("appearance_embedding"), embedding, observation_weight=0.05
+        ),
+        "appearance_gallery": gallery,
+        "appearance_aspect_ratio": observation.get(
+            "appearance_aspect_ratio", previous.get("appearance_aspect_ratio")
+        ),
+        "appearance_tiny": observation.get("appearance_tiny", False),
+        "appearance_touches_edge": observation.get("appearance_touches_edge", False),
+    }

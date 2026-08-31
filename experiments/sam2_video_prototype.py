@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import subprocess
 import tempfile
 import time
 from collections import Counter
@@ -20,6 +21,16 @@ import torch
 from PIL import Image
 
 from detection.grounding_detector import detect_objects
+from detection.grounding_detector import SEARCH_CLASSES
+from detection.scene_vocabulary import (
+    dynamic_verification_candidates,
+    load_scene_proposals,
+    load_scene_vocabulary,
+    merge_verified_scene_proposals,
+    refined_scene_label,
+    possible_scene_label,
+    scene_label_requires_parent_context,
+)
 from tracking.sam2_tracking import (
     consensus_label,
     duplicates_existing_track,
@@ -34,14 +45,21 @@ from tracking.sam2_tracking import (
     confirmed_track_action,
     requires_edge_safe_enrollment,
     touches_frame_edge,
+    find_persistent_identity,
+    update_persistent_identity,
 )
+from tracking.appearance_quality import describe_crop
 
 
-def resolve_detection_labels(frame: np.ndarray, detections: list[dict]) -> list[dict]:
+def resolve_detection_labels(
+    frame: np.ndarray,
+    detections: list[dict],
+    extra_labels=(),
+) -> list[dict]:
     """Canonicalize detector phrases; use SigLIP only for multi-label phrases."""
     resolved = []
     for detection in detections:
-        candidates = label_candidates(detection["object"])
+        candidates = label_candidates(detection["object"], extra_labels=extra_labels)
         if not candidates:
             continue
         selected = candidates[0]
@@ -63,9 +81,15 @@ def resolve_detection_labels(frame: np.ndarray, detections: list[dict]) -> list[
     return resolved
 
 
-def verify_semantic_promotion(frame: np.ndarray, detection: dict) -> dict:
+def verify_semantic_promotion(
+    frame: np.ndarray,
+    detection: dict,
+    dynamic_labels=(),
+) -> dict:
     """Verify high-risk labels before a tentative physical track is promoted."""
     candidates = semantic_promotion_candidates(detection["object"])
+    if not candidates and detection["object"] in dynamic_labels:
+        candidates = dynamic_verification_candidates(detection["object"])
     if not candidates:
         return {"approved": True, "mode": "low_risk"}
 
@@ -92,6 +116,105 @@ def verify_semantic_promotion(frame: np.ndarray, detection: dict) -> dict:
     }
 
 
+def verify_scene_proposals(frame: np.ndarray, proposals: list[dict]):
+    """Semantically verify Florence regions before they can replace detections."""
+    if not proposals:
+        return [], []
+    from verification.verifier import verify_candidates
+
+    verified = []
+    events = []
+    height, width = frame.shape[:2]
+    for proposal in proposals:
+        x1, y1, x2, y2 = proposal["box"]
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(width, x2), min(height, y2)
+        crop = frame[y1:y2, x1:x2]
+        if crop.size == 0:
+            continue
+        candidates = dynamic_verification_candidates(proposal["object"])
+        result = verify_candidates(
+            Image.fromarray(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)),
+            candidates,
+        )
+        # Florence provides independent localization evidence, so the SigLIP
+        # gate may use a slightly lower score/margin than detector-only track
+        # promotion while still requiring the exact proposed label to win.
+        final_label = refined_scene_label(proposal["object"], result)
+        semantically_approved = (
+            final_label is not None
+            and float(result.get("best_score", 0.0)) >= 0.50
+            and float(result.get("margin", 0.0)) >= 0.10
+        )
+        component_only = (
+            semantically_approved
+            and scene_label_requires_parent_context(final_label)
+        )
+        approved = semantically_approved and not component_only
+        possible_label = None if approved else possible_scene_label(
+            proposal["object"], proposal.get("raw_object", proposal["object"])
+        )
+        events.append({
+            "object": proposal["object"],
+            "raw_object": proposal.get("raw_object", proposal["object"]),
+            "box": proposal["box"],
+            "approved": approved,
+            "status": "confirmed" if approved else (
+                "possible" if possible_label else "rejected"
+            ),
+            "possible_label": possible_label,
+            "reason": "component_requires_parent_context" if component_only else None,
+            "result": result,
+        })
+        if approved:
+            verified.append({
+                **proposal,
+                "object": final_label,
+                "discovered_object": proposal["object"],
+                "box": (x1, y1, x2, y2),
+                "confidence": float(result["best_score"]),
+            })
+    return verified, events
+
+
+def add_appearance_embeddings(
+    frame: np.ndarray,
+    detections: list[dict],
+    frame_size: tuple[int, int],
+) -> list[dict]:
+    """Attach one batched set of tight-crop embeddings and quality metadata."""
+    prepared = [dict(detection) for detection in detections]
+    crops = []
+    crop_indices = []
+    width, height = frame_size
+    for index, detection in enumerate(prepared):
+        quality = describe_crop(detection["box"], width, height)
+        detection.update({
+            "appearance_aspect_ratio": quality["aspect_ratio"],
+            "appearance_tiny": quality["tiny"],
+            "appearance_touches_edge": quality["touches_edge"],
+            "appearance_quality": quality["quality"],
+            "appearance_embedding": None,
+        })
+        # Tiny and boundary-truncated crops may help detection, but their
+        # resized pixels are not reliable evidence of physical identity.
+        if not quality["valid"] or quality["tiny"] or quality["touches_edge"]:
+            continue
+        x1, y1, x2, y2 = quality["box"]
+        crop = frame[y1:y2, x1:x2]
+        if crop.size == 0:
+            continue
+        crops.append(Image.fromarray(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)))
+        crop_indices.append(index)
+
+    if crops:
+        from verification.verifier import get_image_embeddings
+
+        for index, embedding in zip(crop_indices, get_image_embeddings(crops)):
+            prepared[index]["appearance_embedding"] = embedding
+    return prepared
+
+
 def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="BHASKARA SAM 2 tracking prototype")
     parser.add_argument("--video", default="videos/room.mp4")
@@ -106,6 +229,25 @@ def parse_arguments() -> argparse.Namespace:
         default=None,
         help="limit extracted frames for a quick validation run",
     )
+    parser.add_argument(
+        "--scene-vocabulary-report",
+        action="append",
+        default=[],
+        help="Florence scene report; may be supplied more than once",
+    )
+    parser.add_argument(
+        "--auto-scene-discovery",
+        action="store_true",
+        help="automatically run isolated Florence discovery before tracking",
+    )
+    parser.add_argument(
+        "--florence-python",
+        default=str(Path(".venv-florence") / "Scripts" / "python.exe"),
+        help="Python executable for the isolated Florence Transformers 4.x runtime",
+    )
+    parser.add_argument("--scene-sample-interval", type=int, default=15)
+    parser.add_argument("--scene-change-threshold", type=float, default=0.32)
+    parser.add_argument("--scene-maximum-gap-seconds", type=float, default=5.0)
     parser.add_argument(
         "--refresh-interval",
         type=int,
@@ -126,6 +268,31 @@ def parse_arguments() -> argparse.Namespace:
         help="faster for short clips but may exhaust VRAM on complete videos",
     )
     return parser.parse_args()
+
+
+def run_automatic_scene_discovery(args, output_directory: Path) -> str:
+    """Run Florence out-of-process so its Transformers version stays isolated."""
+    florence_python = Path(args.florence_python).resolve()
+    if not florence_python.is_file():
+        raise RuntimeError(
+            f"Florence runtime not found: {florence_python}. "
+            "Create .venv-florence as documented in experiments/FLORENCE_SCENE_DISCOVERY.md."
+        )
+    report_path = (output_directory / "automatic_scene_report.json").resolve()
+    command = [
+        str(florence_python),
+        "-m", "experiments.florence_scene_discovery",
+        "--video", str(Path(args.video).resolve()),
+        "--output", str(report_path),
+        "--auto-scenes",
+        "--scene-sample-interval", str(args.scene_sample_interval),
+        "--scene-change-threshold", str(args.scene_change_threshold),
+        "--scene-maximum-gap-seconds", str(args.scene_maximum_gap_seconds),
+    ]
+    if args.max_frames is not None:
+        command.extend(["--maximum-frame", str(max(0, args.max_frames - 1))])
+    subprocess.run(command, check=True, cwd=Path(__file__).resolve().parents[1])
+    return str(report_path)
 
 
 def extract_frames(
@@ -168,6 +335,9 @@ def main() -> None:
     args = parse_arguments()
     output_directory = Path(args.output)
     output_directory.mkdir(parents=True, exist_ok=True)
+    scene_report_paths = list(args.scene_vocabulary_report)
+    if args.auto_scene_discovery:
+        scene_report_paths.append(run_automatic_scene_discovery(args, output_directory))
     device = "cuda" if torch.cuda.is_available() else "cpu"
     started = time.perf_counter()
 
@@ -178,11 +348,27 @@ def main() -> None:
             frame_directory,
             max_frames=args.max_frames,
         )
+        dynamic_labels = load_scene_vocabulary(scene_report_paths)
+        scene_proposals = load_scene_proposals(scene_report_paths)
+        proposal_frames = sorted(
+            frame_index
+            for frame_index in scene_proposals
+            if frame_index > args.prompt_frame
+        )
+        detector_search_classes = SEARCH_CLASSES
         prompt_frame = read_prompt_frame(frame_directory, args.prompt_frame)
         detections = resolve_detection_labels(
             prompt_frame,
-            detect_objects(prompt_frame),
+            detect_objects(prompt_frame, search_classes=detector_search_classes),
+            extra_labels=dynamic_labels,
+        )
+        prompt_proposals, prompt_scene_events = verify_scene_proposals(
+            prompt_frame, scene_proposals.get(args.prompt_frame, [])
+        )
+        detections = merge_verified_scene_proposals(
+            detections, prompt_proposals
         )[: args.max_objects]
+        detections = add_appearance_embeddings(prompt_frame, detections, frame_size)
         if not detections:
             raise RuntimeError("Grounding DINO found no objects on the prompt frame")
 
@@ -200,6 +386,85 @@ def main() -> None:
         confirmations: dict[int, int] = {}
         track_status: dict[int, str] = {}
         missed_refreshes: dict[int, int] = {}
+        authoritative_labels: dict[int, str] = {}
+        track_appearances: dict[int, dict] = {}
+        track_memory_ids: dict[int, int] = {}
+        physical_identities: dict[int, dict] = {}
+        identity_events = []
+        scene_proposal_events = [
+            {"frame_index": args.prompt_frame, **event}
+            for event in prompt_scene_events
+        ]
+        next_memory_id = 1
+
+        def assign_persistent_identity(
+            track_id: int,
+            detection: dict,
+            frame_index: int,
+            allow_reuse: bool,
+        ) -> int:
+            nonlocal next_memory_id
+            observation = {**detection, "object": labels[track_id]}
+            refined_from_generic = (
+                detection.get("source") == "florence"
+                and detection.get("discovered_object")
+                and detection.get("discovered_object") != observation["object"]
+            )
+            compatible_identity_labels = ()
+            if refined_from_generic:
+                compatible_identity_labels = dynamic_verification_candidates(
+                    detection["discovered_object"]
+                )
+            if allow_reuse:
+                match, diagnostics = find_persistent_identity(
+                    observation,
+                    physical_identities,
+                    return_diagnostics=True,
+                    compatible_labels=compatible_identity_labels,
+                )
+            else:
+                match = None
+                diagnostics = {"reason": "initial_identity"}
+            if match is None:
+                memory_id = next_memory_id
+                next_memory_id += 1
+                event = "created"
+            else:
+                memory_id = match["memory_id"]
+                event = "reidentified"
+            track_memory_ids[track_id] = memory_id
+            if match is not None and refined_from_generic:
+                # The independently localized and verified specific class is
+                # authoritative for every fragment already sharing this
+                # physical identity. This repairs memory instead of creating
+                # a parallel AC and medicine-box identity.
+                for previous_track_id, previous_memory_id in track_memory_ids.items():
+                    if previous_track_id == track_id or previous_memory_id != memory_id:
+                        continue
+                    corrected_label = observation["object"]
+                    label_votes[previous_track_id][corrected_label] = max(
+                        label_votes[previous_track_id][corrected_label],
+                        max(label_votes[previous_track_id].values()) + 1,
+                    )
+                    labels[previous_track_id] = corrected_label
+                    authoritative_labels[previous_track_id] = corrected_label
+            physical_identities[memory_id] = update_persistent_identity(
+                physical_identities.get(memory_id), observation
+            )
+            identity_events.append({
+                "frame_index": frame_index,
+                "track_id": track_id,
+                "memory_id": memory_id,
+                "event": event,
+                "similarity": match.get("similarity") if match else None,
+                "second_best_similarity": (
+                    match.get("second_best_similarity") if match else None
+                ),
+                "margin": match.get("margin") if match else None,
+                "match_diagnostics": diagnostics,
+            })
+            return memory_id
+
         for track_id, detection in enumerate(detections, start=1):
             labels[track_id] = detection["object"]
             confidences[track_id] = float(detection["confidence"])
@@ -207,6 +472,12 @@ def main() -> None:
             confirmations[track_id] = 1
             track_status[track_id] = "confirmed"
             missed_refreshes[track_id] = 0
+            if detection.get("source") == "florence":
+                authoritative_labels[track_id] = detection["object"]
+            track_appearances[track_id] = detection
+            assign_persistent_identity(
+                track_id, detection, args.prompt_frame, allow_reuse=False
+            )
             box = np.asarray(detection["box"], dtype=np.float32)
             predictor.add_new_points_or_box(
                 inference_state=state,
@@ -228,6 +499,13 @@ def main() -> None:
                 chunk_start = args.prompt_frame
                 while chunk_start < frame_count:
                     chunk_end = min(frame_count - 1, chunk_start + interval - 1)
+                    upcoming_proposals = [
+                        frame_index
+                        for frame_index in proposal_frames
+                        if chunk_start <= frame_index < chunk_end
+                    ]
+                    if upcoming_proposals:
+                        chunk_end = upcoming_proposals[0]
                     end_boxes = {}
                     for frame_index, object_ids, mask_logits in predictor.propagate_in_video(
                         state,
@@ -260,7 +538,26 @@ def main() -> None:
                         break
 
                     refresh_frame = read_prompt_frame(frame_directory, chunk_end)
-                    refreshed = resolve_detection_labels(refresh_frame, detect_objects(refresh_frame))
+                    refreshed = resolve_detection_labels(
+                        refresh_frame,
+                        detect_objects(
+                            refresh_frame, search_classes=detector_search_classes
+                        ),
+                        extra_labels=dynamic_labels,
+                    )
+                    verified_proposals, proposal_events = verify_scene_proposals(
+                        refresh_frame, scene_proposals.get(chunk_end, [])
+                    )
+                    scene_proposal_events.extend(
+                        {"frame_index": chunk_end, **proposal_event}
+                        for proposal_event in proposal_events
+                    )
+                    refreshed = merge_verified_scene_proposals(
+                        refreshed, verified_proposals
+                    )
+                    refreshed = add_appearance_embeddings(
+                        refresh_frame, refreshed, frame_size
+                    )
                     assignments, unmatched = match_detections_to_tracks(
                         end_boxes,
                         refreshed,
@@ -282,6 +579,16 @@ def main() -> None:
                     for track_id, detection_index in assignments.items():
                         detection = refreshed[detection_index]
                         newest = detection["object"]
+                        authoritative = authoritative_labels.get(track_id)
+                        if (
+                            authoritative is not None
+                            and detection.get("source") != "florence"
+                            and newest != authoritative
+                        ):
+                            # Use the detector's fresh geometry while retaining
+                            # the independently verified landmark semantics.
+                            newest = authoritative
+                            detection = {**detection, "object": authoritative}
                         if (
                             track_status[track_id] == "tentative"
                             and newest != labels[track_id]
@@ -289,6 +596,21 @@ def main() -> None:
                             unmatched.append(detection_index)
                             continue
                         matched_track_ids.add(track_id)
+                        if (
+                            detection.get("source") == "florence"
+                            and newest != labels[track_id]
+                        ):
+                            # A Florence region whose label independently won
+                            # the SigLIP confusion check is stronger than one
+                            # ordinary detector vote. Preserve the physical
+                            # track but let the corrected label take the lead.
+                            label_votes[track_id][newest] = max(
+                                label_votes[track_id][newest],
+                                max(label_votes[track_id].values()),
+                            )
+                            authoritative_labels[track_id] = newest
+                        elif detection.get("source") == "florence":
+                            authoritative_labels[track_id] = newest
                         label_votes[track_id][newest] += 1
                         confirmations[track_id] += 1
                         missed_refreshes[track_id] = 0
@@ -296,6 +618,7 @@ def main() -> None:
                         confidences[track_id] = max(
                             confidences[track_id], float(detection["confidence"])
                         )
+                        track_appearances[track_id] = detection
                         predictor.add_new_points_or_box(
                             inference_state=state,
                             frame_idx=chunk_end,
@@ -308,7 +631,7 @@ def main() -> None:
                             )
                             if action == "promote":
                                 semantic = verify_semantic_promotion(
-                                    refresh_frame, detection
+                                    refresh_frame, detection, dynamic_labels
                                 )
                                 semantic_events.append({
                                     "frame_index": chunk_end,
@@ -318,6 +641,9 @@ def main() -> None:
                                 })
                                 if semantic["approved"]:
                                     track_status[track_id] = "confirmed"
+                                    assign_persistent_identity(
+                                        track_id, detection, chunk_end, allow_reuse=True
+                                    )
                                     event["promoted"] += 1
                                 else:
                                     track_status[track_id] = "discarded"
@@ -356,6 +682,12 @@ def main() -> None:
                             continue
                         if track_id in matched_track_ids:
                             missed_refreshes[track_id] = 0
+                            memory_id = track_memory_ids.get(track_id)
+                            if memory_id is not None:
+                                physical_identities[memory_id] = update_persistent_identity(
+                                    physical_identities.get(memory_id),
+                                    {**track_appearances[track_id], "object": labels[track_id]},
+                                )
                             continue
                         missed_refreshes[track_id] += 1
                         action = confirmed_track_action(
@@ -390,10 +722,20 @@ def main() -> None:
                         labels[track_id] = detection["object"]
                         confidences[track_id] = float(detection["confidence"])
                         label_votes[track_id] = Counter({detection["object"]: 1})
-                        confirmations[track_id] = 1
-                        track_status[track_id] = "tentative"
+                        scene_confirmed = detection.get("source") == "florence"
+                        if scene_confirmed:
+                            authoritative_labels[track_id] = detection["object"]
+                        confirmations[track_id] = 2 if scene_confirmed else 1
+                        track_status[track_id] = (
+                            "confirmed" if scene_confirmed else "tentative"
+                        )
                         missed_refreshes[track_id] = 0
                         visible_frames[track_id] = 0
+                        track_appearances[track_id] = detection
+                        if scene_confirmed:
+                            assign_persistent_identity(
+                                track_id, detection, chunk_end, allow_reuse=True
+                            )
                         predictor.add_new_points_or_box(
                             inference_state=state,
                             frame_idx=chunk_end,
@@ -418,7 +760,24 @@ def main() -> None:
                 if final_tentative_ids:
                     final_frame = read_prompt_frame(frame_directory, frame_count - 1)
                     final_detections = resolve_detection_labels(
-                        final_frame, detect_objects(final_frame)
+                        final_frame,
+                        detect_objects(
+                            final_frame, search_classes=detector_search_classes
+                        ),
+                        extra_labels=dynamic_labels,
+                    )
+                    final_proposals, final_proposal_events = verify_scene_proposals(
+                        final_frame, scene_proposals.get(frame_count - 1, [])
+                    )
+                    scene_proposal_events.extend(
+                        {"frame_index": frame_count - 1, **proposal_event}
+                        for proposal_event in final_proposal_events
+                    )
+                    final_detections = merge_verified_scene_proposals(
+                        final_detections, final_proposals
+                    )
+                    final_detections = add_appearance_embeddings(
+                        final_frame, final_detections, frame_size
                     )
                     final_boxes = {
                         observation["track_id"]: observation["box"]
@@ -441,7 +800,9 @@ def main() -> None:
                             and final_detections[detection_index]["object"] == labels[track_id]
                         ):
                             semantic = verify_semantic_promotion(
-                                final_frame, final_detections[detection_index]
+                                final_frame,
+                                final_detections[detection_index],
+                                dynamic_labels,
                             )
                             semantic_events.append({
                                 "frame_index": frame_count - 1,
@@ -454,6 +815,13 @@ def main() -> None:
                                 confirmations[track_id] += 1
                                 label_votes[track_id][labels[track_id]] += 1
                                 track_status[track_id] = "confirmed"
+                                track_appearances[track_id] = final_detections[detection_index]
+                                assign_persistent_identity(
+                                    track_id,
+                                    final_detections[detection_index],
+                                    frame_count - 1,
+                                    allow_reuse=True,
+                                )
                                 continue
                         track_status[track_id] = "discarded"
                         final_tentatives_discarded += 1
@@ -469,6 +837,21 @@ def main() -> None:
         "fps": fps,
         "frame_size": frame_size,
         "prompt_frame": args.prompt_frame,
+        "dynamic_scene_labels": dynamic_labels,
+        "scene_proposal_events": scene_proposal_events,
+        "possible_observations": [
+            {
+                "frame_index": event["frame_index"],
+                "object": event["possible_label"],
+                "raw_object": event["raw_object"],
+                "box": event["box"],
+                "status": "possible",
+                "memory_id": None,
+                "reason": event.get("reason") or "partial_object_evidence",
+            }
+            for event in scene_proposal_events
+            if event.get("status") == "possible" and event.get("possible_label")
+        ],
         "elapsed_seconds": round(time.perf_counter() - started, 3),
         "tracks": [
             {
@@ -479,12 +862,28 @@ def main() -> None:
                 "confirmations": confirmations[track_id],
                 "label_votes": dict(label_votes[track_id]),
                 "status": track_status[track_id],
+                "memory_id": track_memory_ids.get(track_id),
+                "authoritative_label": authoritative_labels.get(track_id),
             }
             for track_id in sorted(labels)
         ],
         "observations": observations,
         "refresh_events": refresh_events,
         "semantic_events": semantic_events,
+        "identity_events": identity_events,
+        "physical_identities": [
+            {
+                "memory_id": memory_id,
+                "object": identity["object"],
+                "appearance_views": len(identity.get("appearance_gallery", [])),
+                "track_ids": sorted(
+                    track_id
+                    for track_id, assigned_memory_id in track_memory_ids.items()
+                    if assigned_memory_id == memory_id
+                ),
+            }
+            for memory_id, identity in sorted(physical_identities.items())
+        ],
         "final_tentatives_discarded": final_tentatives_discarded,
     }
     report_path = output_directory / "report.json"

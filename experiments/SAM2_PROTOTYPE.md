@@ -18,6 +18,13 @@ python -m experiments.sam2_video_prototype --video videos/room.mp4
 Use `--max-frames 120 --max-objects 3` for a short end-to-end validation
 before running all 677 frames and every initial detection.
 
+With the isolated Florence runtime installed, automatic scene discovery can be
+included in the same command:
+
+```powershell
+python -m experiments.sam2_video_prototype --video videos/room.mp4 --output outputs/sam2_auto_scene --auto-scene-discovery
+```
+
 The machine-readable result is written to
 `outputs/sam2_prototype/report.json`. The report records immutable track IDs,
 initial detector labels, per-frame mask boxes and areas, and visibility counts.
@@ -72,3 +79,18 @@ Combined detector phrases such as `door cabinet shelf` are treated as
 ambiguous. The existing SigLIP verifier selects among the contained canonical
 labels, and low-margin results are rejected instead of silently choosing the
 first word.
+
+## Persistent physical identity
+
+SAM object IDs are tracking-session handles, not permanent object identities.
+The prototype therefore reports both:
+
+- `track_id`: the disposable SAM 2 mask track.
+- `memory_id`: BHASKARA's persistent physical-object identity.
+
+Only confirmed tracks receive a memory ID. A returning same-label track may
+reuse an older memory ID when its tight-crop SigLIP embedding clears the
+appearance threshold and has a clear margin over every other candidate.
+Different-looking, ambiguous, missing-embedding, severe-aspect-change, tiny,
+and frame-edge observations remain separate. Each identity retains a small
+gallery of diverse tight-object views; context embeddings are not generated.

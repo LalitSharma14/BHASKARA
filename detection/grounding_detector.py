@@ -105,7 +105,8 @@ def detect_objects(
     image_input,
     box_threshold=0.20,
     text_threshold=0.20,
-    nms_threshold=0.40
+    nms_threshold=0.40,
+    search_classes=None,
 ):
     """
     Run Grounding DINO on an image.
@@ -180,8 +181,9 @@ def detect_objects(
     # 6. Create Grounding DINO text prompt
     # --------------------------------------------------
 
+    active_search_classes = search_classes or SEARCH_CLASSES
     text_prompt = (
-        ". ".join(SEARCH_CLASSES)
+        ". ".join(active_search_classes)
         + "."
     )
 

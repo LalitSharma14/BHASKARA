@@ -1,6 +1,10 @@
 venv/
+.venv-florence/
 __pycache__/
 *.pyc
 runs/
 *.pt
 /outputs/sam2_*/
+/outputs/florence_*/
+/outputs/*.jpg
+/videos/reid_test.mp4
